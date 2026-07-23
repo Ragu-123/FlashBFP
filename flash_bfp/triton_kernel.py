@@ -40,15 +40,16 @@ def oabf_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
     
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_ptr = x_ptr + offs_am[:, None] * stride_am + (k * BLOCK_SIZE_K + offs_k)[None, :] * stride_ak
-        a_tile = tl.load(a_ptr)
+        a_mask = offs_am[:, None] < M
+        a_tile = tl.load(a_ptr, mask=a_mask, other=0.0)
         
         w_tile = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
         
@@ -81,7 +82,8 @@ def oabf_gemm_kernel(
         accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
     c_ptr = y_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
-    tl.store(c_ptr, accumulator)
+    c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
+    tl.store(c_ptr, accumulator, mask=c_mask)
 
 
 def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
