@@ -135,19 +135,21 @@ class OABFLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
 
-    def load_from_weight(self, W: torch.Tensor, compressor):
+    def load_from_weight(self, W: torch.Tensor, compressor, device):
         """
         Compresses and loads weight matrix W into this linear layer on-the-fly.
+        Compression runs entirely on the CPU to prevent device mismatch errors.
         """
-        self.dense_payload, self.sparse_outliers = compressor.compress_matrix(W)
+        self.dense_payload, self.sparse_outliers = compressor.compress_matrix(W.cpu())
         
-        self.dense_payload['exponents'] = self.dense_payload['exponents'].to(W.device)
-        self.dense_payload['signs'] = self.dense_payload['signs'].to(W.device)
-        self.dense_payload['payload'] = self.dense_payload['payload'].to(W.device)
+        # Send compressed tensors to the target device
+        self.dense_payload['exponents'] = self.dense_payload['exponents'].to(device)
+        self.dense_payload['signs'] = self.dense_payload['signs'].to(device)
+        self.dense_payload['payload'] = self.dense_payload['payload'].to(device)
         
-        self.sparse_outliers['block_idx'] = self.sparse_outliers['block_idx'].to(W.device)
-        self.sparse_outliers['offset'] = self.sparse_outliers['offset'].to(W.device)
-        self.sparse_outliers['value'] = self.sparse_outliers['value'].to(W.device)
+        self.sparse_outliers['block_idx'] = self.sparse_outliers['block_idx'].to(device)
+        self.sparse_outliers['offset'] = self.sparse_outliers['offset'].to(device)
+        self.sparse_outliers['value'] = self.sparse_outliers['value'].to(device)
         
         self.compressed = True
 

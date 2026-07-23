@@ -34,33 +34,28 @@ class OABFCompressor:
     def compress_matrix(self, W: torch.Tensor) -> Tuple[Dict, Dict]:
         """
         Compresses weight matrix W of shape (out_features, in_features).
-        Returns the compressed dense payload (signs, exponents, packed mantissas)
-        and the sparse outlier list in Coordinate format.
+        Runs entirely on the CPU to prevent device mismatch errors and optimize memory.
         """
         if W.numel() == 0:
             raise ValueError("Weight matrix cannot be empty.")
             
+        # FORCE execution to CPU to avoid CPU-GPU device mismatch and meta-device errors
+        W = W.detach().cpu()
+        
         orig_shape = W.shape
         C_orig, R_orig = orig_shape  # out_features, in_features
         
-        # Pad rows (in_features) to multiple of block_size (16)
+        # Pad rows to multiple of block_size (16) and columns to multiple of tile_size (64)
         remainder_r = R_orig % self.block_size
         padded_R = R_orig if remainder_r == 0 else R_orig + (self.block_size - remainder_r)
-        
-        # Pad columns (out_features) to multiple of tile_size (64)
         remainder_c = C_orig % self.tile_size
         padded_C = C_orig if remainder_c == 0 else C_orig + (self.tile_size - remainder_c)
         
-        # Pad weight matrix
         pad_r = padded_R - R_orig
         pad_c = padded_C - C_orig
         W_padded = torch.nn.functional.pad(W, (0, pad_r, 0, pad_c), mode='constant', value=0.0)
         
-        # Column-Major flattening to ensure contiguous GPU reading of column tiles
-        # Shape: (padded_C, padded_R) -> W_padded.t() has shape (padded_R, padded_C)
-        # Flattening W_padded.t() column-by-column means we flatten W_padded directly in row-major
-        # because W_padded has shape (padded_C, padded_R).
-        # Yes! Flat representation of Column-Major weight tiles is W_padded.flatten()
+        # Column-Major flattening
         W_flat = W_padded.flatten()
         size = W_flat.numel()
         
@@ -70,17 +65,9 @@ class OABFCompressor:
         outlier_indices = torch.where(outlier_mask)[0]
         outlier_values = W_flat[outlier_indices]
         
-        # Zero out outliers in the dense matrix
-        dense_W = torch.where(outlier_mask, 0.0, W_flat)
+        dense_W = jnp_dense_W = torch.where(outlier_mask, 0.0, W_flat)
         
-        # Column-Major coordinate indices:
-        # Since it is column-major, index represents column-major position:
-        # row = index % padded_R, col = index // padded_R
-        # W_padded shape is (padded_C, padded_R).
-        # In flat row-major W_padded, the index matches row-major, which is:
-        # row = index % padded_R, col = index // padded_R (since row dimension of W_padded is C)
-        # Wait: W_padded index is index = col * padded_R + row.
-        # So row = index % padded_R, col = index // padded_R is exactly column-major mapping!
+        # Column-Major Indexing: row = index % R_padded, col = index // R_padded
         block_indices = outlier_indices // self.block_size
         block_offsets = outlier_indices % self.block_size
         
@@ -103,19 +90,17 @@ class OABFCompressor:
         blocks_aligned = torch.abs(blocks) / scale_factors[:, None]
         
         # Quantize aligned mantissas to 4 bits [0, 15]
-        # (This is the real, physical 4-bit quantization step!)
         mantissas_int = torch.clamp(torch.round(blocks_aligned * 15.0), 0, 15).to(torch.int32)
         
-        # Signs (True = negative, False = positive)
+        # Signs
         signs = (blocks < 0)
         
-        # --- BIT-PACKING ENGINE ---
-        # Pack 16 signs into a single uint16 word
+        # Pack signs into uint16 word on CPU
         signs_packed = torch.zeros(num_blocks, dtype=torch.int16, device=W.device)
         for i in range(16):
             signs_packed |= (signs[:, i].to(torch.int16) << i)
             
-        # Pack sixteen 4-bit mantissas into two int32 words (each word holds 8 mantissas)
+        # Pack mantissas into two int32 words on CPU
         payload = torch.zeros((num_blocks, 2), dtype=torch.int32, device=W.device)
         for i in range(8):
             payload[:, 0] |= (mantissas_int[:, i] << (i * 4))

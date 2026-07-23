@@ -44,7 +44,7 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         oabf_layer = oabf_layer.to(original_linear.weight.device)
         # Compress and load weight parameters on-the-fly
         # Weight in nn.Linear is stored as (out_features, in_features)
-        oabf_layer.load_from_weight(original_linear.weight.data, compressor)
+        oabf_layer.load_from_weight(original_linear.weight.data, compressor, device=original_linear.weight.device)
         
         # Replace sub-module inside the parent module
         setattr(parent_module, sub_name, oabf_layer)

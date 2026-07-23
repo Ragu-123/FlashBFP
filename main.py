@@ -40,7 +40,7 @@ def main():
         
         # Instantiate linear layer and load weight
         oabf_layer = OABFLinear(in_features=d_in, out_features=d_out, bias=False)
-        oabf_layer.load_from_weight(W, compressor)
+        oabf_layer.load_from_weight(W, compressor, device=torch.device("cuda"))
         
         # Run inference
         X = torch.randn(128, d_in).cuda()
