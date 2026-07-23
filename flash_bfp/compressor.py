@@ -34,13 +34,12 @@ class OABFCompressor:
     def compress_matrix(self, W: torch.Tensor) -> Tuple[Dict, Dict]:
         """
         Compresses weight matrix W of shape (out_features, in_features).
-        Runs entirely on the CPU to prevent device mismatch errors and optimize memory.
+        Runs on W's device (GPU or CPU) for maximum acceleration.
         """
         if W.numel() == 0:
             raise ValueError("Weight matrix cannot be empty.")
             
-        # FORCE execution to CPU to avoid CPU-GPU device mismatch and meta-device errors
-        W = W.detach().cpu()
+        W = W.detach()
         
         orig_shape = W.shape
         C_orig, R_orig = orig_shape  # out_features, in_features
