@@ -89,7 +89,15 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     """
     PyTorch wrapper that configures and launches the Triton fused OABF GEMM kernel.
     CPU fallback is automatically executed for offloaded layers.
+    Payload tensors are auto-synced to X's device before launch.
     """
+    target_device = X.device
+    
+    # --- Auto-sync payload tensors to X's device ---
+    for key in ('exponents', 'signs', 'payload'):
+        if dense_payload[key].device != target_device:
+            dense_payload[key] = dense_payload[key].to(target_device)
+    
     if not X.is_cuda or not HAS_TRITON:
         # --- CPU Fallback Path ---
         # Decompress weights on CPU and run PyTorch matmul
@@ -173,19 +181,42 @@ class OABFLinear(torch.nn.Module):
         """
         Compresses and loads weight matrix W into this linear layer on-the-fly.
         Compression runs entirely on the CPU to prevent device mismatch errors.
+        Compressed tensors are registered as persistent buffers so that
+        accelerate's device hooks can track and move them automatically.
         """
-        self.dense_payload, self.sparse_outliers = compressor.compress_matrix(W.cpu())
+        dense_payload, sparse_outliers = compressor.compress_matrix(W.cpu())
         
-        # Send compressed tensors to the target device
-        self.dense_payload['exponents'] = self.dense_payload['exponents'].to(device)
-        self.dense_payload['signs'] = self.dense_payload['signs'].to(device)
-        self.dense_payload['payload'] = self.dense_payload['payload'].to(device)
+        # Register compressed dense tensors as persistent buffers
+        # This makes accelerate aware of them for device_map movement
+        self.register_buffer('_dp_exponents', dense_payload['exponents'].to(device))
+        self.register_buffer('_dp_signs', dense_payload['signs'].to(device))
+        self.register_buffer('_dp_payload', dense_payload['payload'].to(device))
         
-        self.sparse_outliers['block_idx'] = self.sparse_outliers['block_idx'].to(device)
-        self.sparse_outliers['offset'] = self.sparse_outliers['offset'].to(device)
-        self.sparse_outliers['value'] = self.sparse_outliers['value'].to(device)
+        # Store non-tensor metadata directly
+        self.dense_payload = {
+            'padded_shape': dense_payload['padded_shape'],
+            'orig_shape': dense_payload['orig_shape'],
+        }
+        
+        # Register sparse outlier tensors as persistent buffers
+        self.register_buffer('_sp_block_idx', sparse_outliers['block_idx'].to(device))
+        self.register_buffer('_sp_offset', sparse_outliers['offset'].to(device))
+        self.register_buffer('_sp_value', sparse_outliers['value'].to(device))
+        self.sparse_outliers = {
+            'count': sparse_outliers['count'],
+        }
         
         self.compressed = True
+
+    def _get_dense_payload(self):
+        """Assemble live dense_payload dict from registered buffers + metadata."""
+        return {
+            'exponents': self._dp_exponents,
+            'signs': self._dp_signs,
+            'payload': self._dp_payload,
+            'padded_shape': self.dense_payload['padded_shape'],
+            'orig_shape': self.dense_payload['orig_shape'],
+        }
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -200,14 +231,23 @@ class OABFLinear(torch.nn.Module):
         orig_shape = X.shape
         X_flat = X.view(-1, self.in_features)
         
-        Y_dense = oabf_gemm(X_flat, self.dense_payload)
+        live_payload = self._get_dense_payload()
+        Y_dense = oabf_gemm(X_flat, live_payload)
         
         if self.sparse_outliers['count'] > 0:
             R_padded, C_padded = self.dense_payload['padded_shape']
             
-            outlier_block = self.sparse_outliers['block_idx']
-            outlier_offset = self.sparse_outliers['offset']
-            outlier_val = self.sparse_outliers['value']
+            # Read outlier buffers (already tracked by accelerate)
+            outlier_block = self._sp_block_idx
+            outlier_offset = self._sp_offset
+            outlier_val = self._sp_value
+            
+            # Sync outlier tensors to X's device if needed
+            target_device = X.device
+            if outlier_block.device != target_device:
+                outlier_block = outlier_block.to(target_device)
+                outlier_offset = outlier_offset.to(target_device)
+                outlier_val = outlier_val.to(target_device)
             
             global_indices = outlier_block * 16 + outlier_offset
             row_indices = global_indices % R_padded
@@ -230,3 +270,4 @@ class OABFLinear(torch.nn.Module):
             Y_dense = Y_dense + self.bias
             
         return Y_dense.view(*orig_shape[:-1], self.out_features)
+
