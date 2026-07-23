@@ -213,7 +213,7 @@ class OABFLinear(torch.nn.Module):
         PyTorch versions and prevents Triton pointer access errors from exotic
         dtypes like int8, int16, uint16 or uint32.
         """
-        dense_payload, sparse_outliers = compressor.compress_matrix(W)
+        dense_payload, sparse_outliers = compressor.compress_matrix(W.cpu())
         
         # Cast to universally-supported dtypes BEFORE .to(device)
         # int8 exponents -> float32 (Triton loads as float32 anyway)
