@@ -85,16 +85,48 @@ def oabf_gemm_kernel(
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
     tl.store(c_ptr, accumulator, mask=c_mask)
 
-
 def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     """
     PyTorch wrapper that configures and launches the Triton fused OABF GEMM kernel.
+    CPU fallback is automatically executed for offloaded layers.
     """
-    if not HAS_TRITON:
-        raise RuntimeError("Triton is not installed. Fused GEMM execution is only supported on GPU.")
+    if not X.is_cuda or not HAS_TRITON:
+        # --- CPU Fallback Path ---
+        # Decompress weights on CPU and run PyTorch matmul
+        R_padded, C_padded = dense_payload['padded_shape']
+        C_orig, R_orig = dense_payload['orig_shape']
+        num_blocks = dense_payload['payload'].shape[0]
         
-    assert X.is_cuda, "Input tensor X must be on CUDA."
-    
+        exponents = dense_payload['exponents'].float()
+        signs_packed = dense_payload['signs']
+        payload = dense_payload['payload']
+        
+        # Decompress blocks on CPU
+        unpacked_blocks = torch.zeros((num_blocks, 16), dtype=X.dtype, device=X.device)
+        
+        # Unpack first 8 mantissas
+        for i in range(8):
+            mantissa = (payload[:, 0] >> (i * 4)) & 0xF
+            sign = (signs_packed.to(torch.int32) >> i) & 1
+            val = torch.where(sign == 1, -1.0, 1.0) * (mantissa.to(X.dtype) / 15.0) * torch.pow(2.0, exponents)
+            unpacked_blocks[:, i] = val
+            
+        # Unpack second 8 mantissas
+        for i in range(8):
+            mantissa = (payload[:, 1] >> (i * 4)) & 0xF
+            sign = (signs_packed.to(torch.int32) >> (i + 8)) & 1
+            val = torch.where(sign == 1, -1.0, 1.0) * (mantissa.to(X.dtype) / 15.0) * torch.pow(2.0, exponents)
+            unpacked_blocks[:, i + 8] = val
+            
+        # Reconstruct padded weight matrix: shape (C_padded, R_padded)
+        W_reconstructed = unpacked_blocks.flatten().view(C_padded, R_padded)
+        
+        # Crop to original shape (out_features, in_features)
+        W_reconstructed = W_reconstructed[:C_orig, :R_orig]
+        
+        # Perform standard PyTorch matmul: Y = X * W_reconstructed.t()
+        return torch.matmul(X, W_reconstructed.t())
+        
     M, K_x = X.shape
     R_padded, C_padded = dense_payload['padded_shape']
     C_orig, R_orig = dense_payload['orig_shape']
