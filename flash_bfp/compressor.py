@@ -111,12 +111,12 @@ class OABFCompressor:
         
         # --- BIT-PACKING ENGINE ---
         # Pack 16 signs into a single uint16 word
-        signs_packed = torch.zeros(num_blocks, dtype=torch.int16)
+        signs_packed = torch.zeros(num_blocks, dtype=torch.int16, device=W.device)
         for i in range(16):
             signs_packed |= (signs[:, i].to(torch.int16) << i)
             
         # Pack sixteen 4-bit mantissas into two int32 words (each word holds 8 mantissas)
-        payload = torch.zeros((num_blocks, 2), dtype=torch.int32)
+        payload = torch.zeros((num_blocks, 2), dtype=torch.int32, device=W.device)
         for i in range(8):
             payload[:, 0] |= (mantissas_int[:, i] << (i * 4))
             payload[:, 1] |= (mantissas_int[:, i + 8] << (i * 4))

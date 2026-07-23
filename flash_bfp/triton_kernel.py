@@ -141,13 +141,13 @@ class OABFLinear(torch.nn.Module):
         """
         self.dense_payload, self.sparse_outliers = compressor.compress_matrix(W)
         
-        self.dense_payload['exponents'] = self.dense_payload['exponents'].cuda()
-        self.dense_payload['signs'] = self.dense_payload['signs'].cuda()
-        self.dense_payload['payload'] = self.dense_payload['payload'].cuda()
+        self.dense_payload['exponents'] = self.dense_payload['exponents'].to(W.device)
+        self.dense_payload['signs'] = self.dense_payload['signs'].to(W.device)
+        self.dense_payload['payload'] = self.dense_payload['payload'].to(W.device)
         
-        self.sparse_outliers['block_idx'] = self.sparse_outliers['block_idx'].cuda()
-        self.sparse_outliers['offset'] = self.sparse_outliers['offset'].cuda()
-        self.sparse_outliers['value'] = self.sparse_outliers['value'].cuda()
+        self.sparse_outliers['block_idx'] = self.sparse_outliers['block_idx'].to(W.device)
+        self.sparse_outliers['offset'] = self.sparse_outliers['offset'].to(W.device)
+        self.sparse_outliers['value'] = self.sparse_outliers['value'].to(W.device)
         
         self.compressed = True
 

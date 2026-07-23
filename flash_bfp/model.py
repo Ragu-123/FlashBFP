@@ -40,6 +40,8 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         if original_linear.bias is not None:
             oabf_layer.bias.data.copy_(original_linear.bias.data)
             
+        # Send oabf_layer to the target device immediately to support multi-GPU sharding
+        oabf_layer = oabf_layer.to(original_linear.weight.device)
         # Compress and load weight parameters on-the-fly
         # Weight in nn.Linear is stored as (out_features, in_features)
         oabf_layer.load_from_weight(original_linear.weight.data, compressor)
