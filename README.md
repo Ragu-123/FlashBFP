@@ -38,10 +38,16 @@ oabf_engine/
 Run the following cell inside a Kaggle GPU Notebook to load Gemma 4 12B, perform FlashBFP compression surgery, and run Triton-fused inference:
 
 ```python
-# 1. Clone the repository and add to system path
+# 1. Clean previous clone, clone repository, and add to system path
+!rm -rf FlashBFP
 !git clone https://github.com/Ragu-123/FlashBFP.git
 import sys
 sys.path.append('/kaggle/working/FlashBFP')
+
+# Unload any previously cached flash_bfp modules to force reload from disk
+for module in list(sys.modules.keys()):
+    if module.startswith('flash_bfp'):
+        del sys.modules[module]
 
 # 2. Install dependencies
 !pip install -U triton torch transformers accelerate
