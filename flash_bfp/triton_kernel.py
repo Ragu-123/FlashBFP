@@ -81,7 +81,7 @@ def oabf_gemm_kernel(
         accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
     c_ptr = y_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
-    tl.store(c_ptr, accumulator.to(a_tile.dtype))
+    tl.store(c_ptr, accumulator)
 
 
 def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
