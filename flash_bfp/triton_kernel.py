@@ -78,10 +78,10 @@ def oabf_gemm_kernel(
                 row_idx = step * 16 + i + 8
                 w_tile = tl.where(tl.arange(0, BLOCK_SIZE_K)[:, None] == row_idx, val, w_tile)
                 
-        accumulator += tl.dot(a_tile, w_tile)
+        accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
     c_ptr = y_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
-    tl.store(c_ptr, accumulator.to(tl.float16))
+    tl.store(c_ptr, accumulator.to(a_tile.dtype))
 
 
 def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
@@ -100,7 +100,7 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     if K_x < R_padded:
         X = torch.nn.functional.pad(X, (0, R_padded - K_x), mode='constant', value=0.0)
         
-    Y = torch.empty((M, C_padded), device=X.device, dtype=torch.float16)
+    Y = torch.empty((M, C_padded), device=X.device, dtype=X.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(C_padded, META['BLOCK_SIZE_N']),)
     
     oabf_gemm_kernel[grid](
@@ -182,7 +182,7 @@ class OABFLinear(torch.nn.Module):
             valid_mask = (row_indices < self.in_features) & (col_indices < self.out_features)
             r_idx = row_indices[valid_mask]
             c_idx = col_indices[valid_mask]
-            v_val = outlier_val[valid_mask]
+            v_val = outlier_val[valid_mask].to(X.dtype)
             
             X_active = X_flat[:, r_idx]
             products = X_active * v_val[None, :]

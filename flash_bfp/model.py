@@ -26,8 +26,13 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
     find_linear_layers(model)
     print(f"Found {len(linear_layers)} linear projection layers to compress.")
     
-    for parent_module, sub_name, original_linear, full_name in linear_layers:
-        print(f"Compressing {full_name} ({original_linear.in_features}x{original_linear.out_features})...")
+    from tqdm import tqdm
+    
+    pbar = tqdm(linear_layers, desc="Compressing layers", dynamic_ncols=True)
+    for parent_module, sub_name, original_linear, full_name in pbar:
+        # Update progress bar postfix with a clean, truncated layer name
+        display_name = full_name.replace("model.model.language_model.", "")
+        pbar.set_postfix_str(f"{display_name[:45]}")
         
         # Instantiate OABF Linear Layer
         oabf_layer = OABFLinear(
@@ -54,5 +59,5 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         if original_linear.bias is not None:
             del original_linear.bias
             
-    print("Gemma 4 model compression completed successfully! All linear layers are now running Fused Triton kernels.")
+    print("\nGemma 4 model compression completed successfully! All linear layers are now running Fused Triton kernels.")
     return model
