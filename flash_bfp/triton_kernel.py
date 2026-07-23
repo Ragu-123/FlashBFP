@@ -285,7 +285,9 @@ class OABFLinear(torch.nn.Module):
                 outlier_offset = outlier_offset.to(exec_device)
                 outlier_val = outlier_val.to(exec_device)
             
-            global_indices = outlier_block * 16 + outlier_offset
+            # Use int64 for ALL index arithmetic to prevent overflow
+            # on large layers (MLP gate/up/down have 82M+ elements)
+            global_indices = outlier_block.long() * 16 + outlier_offset.long()
             row_indices = global_indices % R_padded
             col_indices = global_indices // R_padded
             
