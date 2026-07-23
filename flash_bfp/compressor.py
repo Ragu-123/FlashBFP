@@ -39,7 +39,7 @@ class OABFCompressor:
         if W.numel() == 0:
             raise ValueError("Weight matrix cannot be empty.")
             
-        W = W.detach()
+        W = W.detach().cpu()
         
         orig_shape = W.shape
         C_orig, R_orig = orig_shape  # out_features, in_features
