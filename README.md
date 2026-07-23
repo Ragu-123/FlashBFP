@@ -55,11 +55,12 @@ from flash_bfp.model import compress_gemma_model
 # 3. Load Gemma 4 12B
 model_path = "/kaggle/input/models/google/gemma-4/transformers/gemma-4-12b/2"
 print("Loading Gemma 4 12B model...")
-tokenizer = AutoTokenizer.from_pretrained(model_path)
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
     torch_dtype=torch.bfloat16,
-    device_map="auto"
+    device_map="auto",
+    trust_remote_code=True
 )
 
 # 4. Perform dynamic compression surgery
