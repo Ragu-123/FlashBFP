@@ -95,7 +95,7 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     
     M, K_x = X.shape
     R_padded, C_padded = dense_payload['padded_shape']
-    R_orig, C_orig = dense_payload['orig_shape']
+    C_orig, R_orig = dense_payload['orig_shape']
     
     if K_x < R_padded:
         X = torch.nn.functional.pad(X, (0, R_padded - K_x), mode='constant', value=0.0)
