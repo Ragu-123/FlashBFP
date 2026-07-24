@@ -58,6 +58,12 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         del original_linear.weight
         if original_linear.bias is not None:
             del original_linear.bias
+        del original_linear
+        
+        # Reclaim GPU memory cache to prevent VRAM accumulation
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
             
     print("\nGemma 4 model compression completed successfully! All linear layers are now running Fused Triton kernels.")
     return model
