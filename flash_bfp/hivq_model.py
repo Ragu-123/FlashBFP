@@ -121,3 +121,62 @@ def compress_gemma_model_hivq(model):
         
     print("\nGemma 4 model compression to 2-bit completed successfully! All core layers (linear & embedding) are now running HIVQ.")
     return model
+
+
+def load_gemma_model_hivq_skeleton(model):
+    """
+    Traverses the Gemma 4 model graph and replaces target linear and embedding layers
+    with empty HIVQ modules (without running weight compression) so that a saved
+    state dict can be loaded directly in 5 seconds.
+    """
+    print("Replacing layers with empty 2-bit HIVQ skeletons...")
+    
+    linear_layers = []
+    embedding_layers = []
+    
+    def find_target_layers(module, name="model"):
+        for sub_name, sub_module in module.named_children():
+            full_name = f"{name}.{sub_name}"
+            if isinstance(sub_module, torch.nn.Linear):
+                is_target_layer = (
+                    "self_attn" in full_name or
+                    "mlp" in full_name or
+                    "feed_forward" in full_name or
+                    "lconv1d" in full_name or
+                    "per_layer" in full_name or
+                    "lm_head" in full_name
+                )
+                if is_target_layer:
+                    linear_layers.append((module, sub_name, sub_module, full_name))
+            elif isinstance(sub_module, torch.nn.Embedding) or "embedding" in sub_module.__class__.__name__.lower():
+                is_target_emb = "embed_tokens" in full_name or "embedding" in full_name.lower()
+                if is_target_emb:
+                    embedding_layers.append((module, sub_name, sub_module, full_name))
+            else:
+                find_target_layers(sub_module, full_name)
+                
+    find_target_layers(model)
+    print(f"Swapping {len(linear_layers)} linear layers and {len(embedding_layers)} embedding layers with empty HIVQ modules...")
+    
+    # 1. Swap Linear Layers
+    for parent_module, sub_name, original_linear, full_name in linear_layers:
+        hivq_layer = HIVQLinear(
+            in_features=original_linear.in_features,
+            out_features=original_linear.out_features,
+            bias=original_linear.bias is not None
+        )
+        if original_linear.bias is not None:
+            hivq_layer.bias = torch.nn.Parameter(torch.zeros_like(original_linear.bias))
+        setattr(parent_module, sub_name, hivq_layer)
+        
+    # 2. Swap Embedding Layers
+    for parent_module, sub_name, original_emb, full_name in embedding_layers:
+        hivq_emb = HIVQEmbedding(
+            num_embeddings=original_emb.num_embeddings,
+            embedding_dim=original_emb.embedding_dim,
+            padding_idx=original_emb.padding_idx
+        )
+        setattr(parent_module, sub_name, hivq_emb)
+        
+    print("Skeleton replacement completed successfully!")
+    return model
