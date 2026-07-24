@@ -156,12 +156,15 @@ class HIVQLinear(torch.nn.Module):
         scales = self._scales.to(device=device, dtype=dtype)
         e8_indices = self._e8_indices.to(device=device)
         
+        # Deconstruct 16-bit indices into 8-bit lut_idx and 8-bit sign_bits
         lut_idx = (e8_indices & 0xFF).long()
         sign_bits = (e8_indices >> 8) & 0xFF
         
+        # Lookup magnitudes from 256-entry grid
         grid = E8Codebook.get_instance(device=device).grid.to(dtype=dtype)
-        mags = grid[lut_idx]
+        mags = grid[lut_idx] # [out_features * N_in // 8, 8]
         
+        # Reconstruct element-wise signs (+1 or -1)
         shifts = torch.arange(8, device=device)
         sign_vectors = 1.0 - 2.0 * ((sign_bits.unsqueeze(-1) >> shifts) & 1).to(dtype=dtype)
         
@@ -360,7 +363,7 @@ class HIVQEmbedding(torch.nn.Module):
         
         token_vectors = (mags * sign_vectors).view(-1, N_in)
         
-        token_scales = torch.index_select(self._scales.to(device), 0, flat_ids)
+        token_scales = torch.index_select(self._scales.to(device=device, dtype=dtype), 0, flat_ids)
         token_vectors = token_vectors * token_scales.unsqueeze(-1)
         
         W_rot = fwht(token_vectors)
@@ -368,8 +371,8 @@ class HIVQEmbedding(torch.nn.Module):
         x_rot = W_rot[..., :D] * signs.unsqueeze(0)
         
         if is_single:
-            return x_rot.squeeze(0)
-        return x_rot
+            return x_rot.squeeze(0).to(dtype=dtype)
+        return x_rot.to(dtype=dtype)
 
     def materialize_weight(self, device, dtype):
         return self.materialize_rows(torch.arange(self.num_embeddings, device=device), device=device, dtype=dtype)
