@@ -122,11 +122,9 @@ def compress_gemma_model_hivq(model):
         else:
             target_device = weight_device
             
+        # Gemma4TextScaledWordEmbedding already multiplies by embed_scale (sqrt(d_model)),
+        # so HIVQEmbedding should output unscaled embeddings (embed_scale=1.0) to prevent double scaling.
         embed_scale = 1.0
-        if hasattr(original_emb, "embed_scale"):
-            embed_scale = original_emb.embed_scale.item()
-        elif hasattr(original_emb, "scalar_embed_scale"):
-            embed_scale = original_emb.scalar_embed_scale
             
         hivq_emb = HIVQEmbedding(
             num_embeddings=original_emb.num_embeddings,
