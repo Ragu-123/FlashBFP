@@ -183,18 +183,20 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     Y = torch.empty((M, C_padded), device=target_device, dtype=X.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(C_padded, META['BLOCK_SIZE_N']),)
     
-    oabf_gemm_kernel[grid](
-        X, Y,
-        exponents,
-        signs,
-        payload_flat,
-        M, C_padded, R_padded,
-        X.stride(0), X.stride(1),
-        Y.stride(0), Y.stride(1),
-        BLOCK_SIZE_M=64,
-        BLOCK_SIZE_N=64,
-        BLOCK_SIZE_K=16
-    )
+    # Wrap in CUDA device context manager to ensure Triton launches on the correct GPU
+    with torch.cuda.device(target_device):
+        oabf_gemm_kernel[grid](
+            X, Y,
+            exponents,
+            signs,
+            payload_flat,
+            M, C_padded, R_padded,
+            X.stride(0), X.stride(1),
+            Y.stride(0), Y.stride(1),
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=64,
+            BLOCK_SIZE_K=16
+        )
     
     return Y[:, :C_orig]
 
