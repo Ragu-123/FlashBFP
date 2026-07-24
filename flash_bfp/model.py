@@ -17,8 +17,10 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         for sub_name, sub_module in module.named_children():
             full_name = f"{name}.{sub_name}"
             if isinstance(sub_module, torch.nn.Linear):
-                # Avoid modifying output projection or specific layers if requested,
-                # but standard practice is to compress all QKV, projection, and FFN layers.
+                # Skip output projection head (lm_head) to preserve text generation quality
+                if "lm_head" in full_name:
+                    print(f"Skipping compression of output head: {full_name}")
+                    continue
                 linear_layers.append((module, sub_name, sub_module, full_name))
             else:
                 find_linear_layers(sub_module, full_name)
