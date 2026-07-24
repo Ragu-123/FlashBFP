@@ -17,9 +17,17 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         for sub_name, sub_module in module.named_children():
             full_name = f"{name}.{sub_name}"
             if isinstance(sub_module, torch.nn.Linear):
-                # Skip output projection head (lm_head) to preserve text generation quality
-                if "lm_head" in full_name:
-                    print(f"Skipping compression of output head: {full_name}")
+                # Compress only main compute-heavy attention and FFN layers.
+                # Skip small/sensitive auxiliary layers (like lm_head, per-layer gates/projections,
+                # vision/audio embedders and poolers) to preserve full model accuracy.
+                is_target_layer = (
+                    "self_attn" in full_name or
+                    "mlp" in full_name or
+                    "feed_forward" in full_name or
+                    "lconv1d" in full_name
+                )
+                if not is_target_layer:
+                    print(f"Skipping compression of auxiliary/sensitive layer: {full_name}")
                     continue
                 linear_layers.append((module, sub_name, sub_module, full_name))
             else:
