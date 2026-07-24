@@ -379,7 +379,7 @@ class HIVQEmbedding(torch.nn.Module):
             raise RuntimeError("Embedding weights have not been compressed using HIVQ.")
             
         device = input_ids.device
-        dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+        dtype = self._signs.dtype if (hasattr(self, '_signs') and self._signs.numel() > 0) else (torch.bfloat16 if device.type == 'cuda' else torch.float32)
         
         x_rot = self.materialize_rows(input_ids, device=device, dtype=dtype)
         
