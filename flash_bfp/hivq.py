@@ -172,19 +172,23 @@ class HIVQLinear(torch.nn.Module):
         e8_points = conway_sloane_e8(W_norm_grouped)
         
         # 5. Map E8 points to closest codebook index on GPU
+        # Run search on GPU in float16 to leverage Tensor Cores and reduce memory overhead
+        comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         codebook = E8Codebook.get_instance(device=comp_device).codebook
         
-        # Vectorized nearest neighbor search across the 65536 E8 points using memory-efficient matrix multiplication
-        codebook_norms = torch.sum(codebook**2, dim=-1) # [65536]
+        # Cast to float16 for ultra-fast GPU search
+        codebook_half = codebook.to(dtype=torch.float16, device=comp_device)
+        e8_points_half = e8_points.to(dtype=torch.float16, device=comp_device)
+        codebook_norms = torch.sum(codebook_half**2, dim=-1) # [65536]
         
         indices = []
-        batch_size = 1024  # Keep batch size small to limit memory allocation below 300MB
-        for i in range(0, e8_points.shape[0], batch_size):
-            block = e8_points[i:i+batch_size] # [B, 8]
+        batch_size = 16384  # Large batch size to maximize GPU execution and minimize loop overhead
+        for i in range(0, e8_points_half.shape[0], batch_size):
+            block = e8_points_half[i:i+batch_size] # [B, 8]
             block_norms = torch.sum(block**2, dim=-1, keepdim=True) # [B, 1]
             
-            # Distance expansion: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
-            dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook.T) # [B, 65536]
+            # Distance expansion in float16: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
+            dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T) # [B, 65536]
             indices.append(torch.argmin(dists, dim=-1))
             
         indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
