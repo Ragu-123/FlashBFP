@@ -151,53 +151,59 @@ class HIVQLinear(torch.nn.Module):
             self.register_parameter('bias', None)
             
     def load_from_weight(self, W: torch.Tensor, device="cpu"):
-        """Rotates weight using RHT, maps to E8 lattice, and saves compressed representations."""
+        """Rotates weight using RHT, maps to E8 lattice, and saves compressed representations in a row-chunked manner to prevent OOM/TDR."""
         comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # 1. Generate Rademacher signs on GPU
-        signs = torch.randint(0, 2, (self.in_features,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0
+        # 1. Generate Rademacher signs on GPU (safely in float32 then cast)
+        signs = (torch.randint(0, 2, (self.in_features,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0).to(dtype=W.dtype)
         
-        # 2. Apply Rademacher signs and forward FWHT on GPU
-        W_signed = W.to(comp_device) * signs.unsqueeze(0)
-        W_rot = pad_fwht(W_signed)
+        # Process in chunks of rows to prevent large GPU memory allocations and launch failures
+        row_chunk_size = 16384
+        all_scales = []
+        all_indices = []
         
-        # 3. Calculate row-wise scale factors on GPU
-        scales = torch.max(torch.abs(W_rot), dim=-1, keepdim=True)[0] / 3.0
-        scales = torch.clamp(scales, min=1e-5)
-        
-        W_norm = W_rot / scales
-        
-        # 4. Map 8D blocks to E8 and then to codebook indices in CHUNKS on GPU to prevent VRAM spikes (OOM)
-        W_norm_grouped = W_norm.view(-1, 8)
-        num_blocks = W_norm_grouped.shape[0]
-        
-        # Load E8 codebook norms once
         codebook = E8Codebook.get_instance(device=comp_device).codebook
         codebook_half = codebook.to(dtype=torch.float16, device=comp_device)
         codebook_norms = torch.sum(codebook_half**2, dim=-1) # [65536]
         
-        indices = []
-        chunk_size = 131072  # Chunk size for E8 Conway-Sloane rounding (lightweight memory)
-        for i in range(0, num_blocks, chunk_size):
-            block_group = W_norm_grouped[i:i+chunk_size]
+        for start_row in range(0, self.out_features, row_chunk_size):
+            end_row = min(start_row + row_chunk_size, self.out_features)
+            W_chunk = W[start_row:end_row].to(comp_device)
             
-            # Map chunk to E8 using Conway-Sloane on GPU
-            e8_points_chunk = conway_sloane_e8(block_group)
+            # 2. Apply Rademacher signs and forward FWHT on GPU
+            W_chunk_signed = W_chunk * signs.unsqueeze(0)
+            W_chunk_rot = pad_fwht(W_chunk_signed)
             
-            # Run codebook search in smaller batches to guarantee low memory usage (536 MB peak VRAM)
+            # 3. Calculate row-wise scale factors
+            scales_chunk = torch.max(torch.abs(W_chunk_rot), dim=-1, keepdim=True)[0] / 3.0
+            scales_chunk = torch.clamp(scales_chunk, min=1e-5)
+            all_scales.append(scales_chunk.to(device))
+            
+            W_chunk_norm = W_chunk_rot / scales_chunk
+            
+            # 4. Map 8D blocks to E8 and then to codebook indices
+            W_norm_grouped = W_chunk_norm.view(-1, 8)
+            
+            # Conway-Sloane rounding
+            e8_points_chunk = conway_sloane_e8(W_norm_grouped)
             e8_points_half = e8_points_chunk.to(dtype=torch.float16, device=comp_device)
-            batch_size = 4096
-            for j in range(0, e8_points_half.shape[0], batch_size):
-                block = e8_points_half[j:j+batch_size] # [B, 8]
-                block_norms = torch.sum(block**2, dim=-1, keepdim=True) # [B, 1]
-                
-                # Distance expansion in float16: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
-                dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T) # [B, 65536]
-                indices.append(torch.argmin(dists, dim=-1))
             
-        indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
+            # Distance search in small inner batches of 4096 blocks to cap VRAM
+            batch_size = 4096
+            chunk_indices = []
+            for j in range(0, e8_points_half.shape[0], batch_size):
+                block = e8_points_half[j:j+batch_size]
+                block_norms = torch.sum(block**2, dim=-1, keepdim=True)
+                dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T)
+                chunk_indices.append(torch.argmin(dists, dim=-1))
+                
+            all_indices.append(torch.cat(chunk_indices, dim=0).to(device))
+            
+        # Concat all chunk results
+        scales = torch.cat(all_scales, dim=0)
+        indices = torch.cat(all_indices, dim=0).to(torch.int32)
         
-        # Move final buffers to target device (Accelereate managed sharded device)
+        # Move final buffers to target device
         self.register_buffer('_signs', signs.to(device))
         self.register_buffer('_scales', scales.squeeze(-1).to(torch.float32).to(device))
         self.register_buffer('_e8_indices', indices.to(device))
@@ -282,51 +288,57 @@ class HIVQEmbedding(torch.nn.Module):
         self.register_buffer('_e8_indices', torch.empty(0, dtype=torch.int32))
         
     def load_from_weight(self, W: torch.Tensor, device="cpu"):
-        """Rotates embedding weights offline using RHT and maps to E8 lattice representation."""
+        """Rotates embedding weights offline using RHT and maps to E8 lattice representation in a row-chunked manner to prevent OOM/TDR."""
         comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # 1. Generate Rademacher signs on GPU
-        signs = torch.randint(0, 2, (self.embedding_dim,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0
+        # 1. Generate Rademacher signs on GPU (safely in float32 then cast)
+        signs = (torch.randint(0, 2, (self.embedding_dim,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0).to(dtype=W.dtype)
         
-        # 2. Apply Rademacher signs and forward FWHT on GPU
-        W_signed = W.to(comp_device) * signs.unsqueeze(0)
-        W_rot = pad_fwht(W_signed)
+        # Process in chunks of rows to prevent large GPU memory allocations and launch failures
+        row_chunk_size = 16384
+        all_scales = []
+        all_indices = []
         
-        # 3. Calculate row-wise scale factors on GPU
-        scales = torch.max(torch.abs(W_rot), dim=-1, keepdim=True)[0] / 3.0
-        scales = torch.clamp(scales, min=1e-5)
-        
-        W_norm = W_rot / scales
-        
-        # 4. Map 8D blocks to E8 and then to codebook indices in CHUNKS on GPU to prevent VRAM spikes (OOM)
-        W_norm_grouped = W_norm.view(-1, 8)
-        num_blocks = W_norm_grouped.shape[0]
-        
-        # Load E8 codebook norms once
         codebook = E8Codebook.get_instance(device=comp_device).codebook
         codebook_half = codebook.to(dtype=torch.float16, device=comp_device)
         codebook_norms = torch.sum(codebook_half**2, dim=-1) # [65536]
         
-        indices = []
-        chunk_size = 131072  # Chunk size for E8 Conway-Sloane rounding (lightweight memory)
-        for i in range(0, num_blocks, chunk_size):
-            block_group = W_norm_grouped[i:i+chunk_size]
+        for start_row in range(0, self.num_embeddings, row_chunk_size):
+            end_row = min(start_row + row_chunk_size, self.num_embeddings)
+            W_chunk = W[start_row:end_row].to(comp_device)
             
-            # Map chunk to E8 using Conway-Sloane on GPU
-            e8_points_chunk = conway_sloane_e8(block_group)
+            # 2. Apply Rademacher signs and forward FWHT on GPU
+            W_chunk_signed = W_chunk * signs.unsqueeze(0)
+            W_chunk_rot = pad_fwht(W_chunk_signed)
             
-            # Run codebook search in smaller batches to guarantee low memory usage (536 MB peak VRAM)
+            # 3. Calculate row-wise scale factors
+            scales_chunk = torch.max(torch.abs(W_chunk_rot), dim=-1, keepdim=True)[0] / 3.0
+            scales_chunk = torch.clamp(scales_chunk, min=1e-5)
+            all_scales.append(scales_chunk.to(device))
+            
+            W_chunk_norm = W_chunk_rot / scales_chunk
+            
+            # 4. Map 8D blocks to E8 and then to codebook indices
+            W_norm_grouped = W_chunk_norm.view(-1, 8)
+            
+            # Conway-Sloane rounding
+            e8_points_chunk = conway_solane_e8_or_similar = conway_sloane_e8(W_norm_grouped)
             e8_points_half = e8_points_chunk.to(dtype=torch.float16, device=comp_device)
-            batch_size = 4096
-            for j in range(0, e8_points_half.shape[0], batch_size):
-                block = e8_points_half[j:j+batch_size] # [B, 8]
-                block_norms = torch.sum(block**2, dim=-1, keepdim=True) # [B, 1]
-                
-                # Distance expansion in float16: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
-                dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T) # [B, 65536]
-                indices.append(torch.argmin(dists, dim=-1))
             
-        indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
+            # Distance search in small inner batches of 4096 blocks to cap VRAM
+            batch_size = 4096
+            chunk_indices = []
+            for j in range(0, e8_points_half.shape[0], batch_size):
+                block = e8_points_half[j:j+batch_size]
+                block_norms = torch.sum(block**2, dim=-1, keepdim=True)
+                dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T)
+                chunk_indices.append(torch.argmin(dists, dim=-1))
+                
+            all_indices.append(torch.cat(chunk_indices, dim=0).to(device))
+            
+        # Concat all chunk results
+        scales = torch.cat(all_scales, dim=0)
+        indices = torch.cat(all_indices, dim=0).to(torch.int32)
         
         # Move final buffers to target device
         self.register_buffer('_signs', signs.to(device))
