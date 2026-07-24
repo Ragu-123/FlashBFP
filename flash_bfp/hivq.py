@@ -133,10 +133,15 @@ class HIVQLinear(torch.nn.Module):
             for b in range(8):
                 sign_bits |= (block_signs[:, b] << b)
                 
-            # 6. Map absolute magnitudes to 256-entry E8P grid
-            W_abs = W_blocks.float().abs()
-            dists = (W_abs**2).sum(dim=-1, keepdim=True) + grid_norm_sq.unsqueeze(0) - 2.0 * torch.matmul(W_abs, grid.T)
-            lut_idx = torch.argmin(dists, dim=-1).to(torch.int32) # [blocks]
+            # 6. Map absolute magnitudes to 256-entry E8P grid in micro-batches to cap VRAM
+            W_abs_all = W_blocks.float().abs()
+            block_batch_size = 32768
+            lut_idx_list = []
+            for blk_start in range(0, W_abs_all.shape[0], block_batch_size):
+                W_abs_sub = W_abs_all[blk_start:blk_start + block_batch_size]
+                dists_sub = (W_abs_sub**2).sum(dim=-1, keepdim=True) + grid_norm_sq.unsqueeze(0) - 2.0 * torch.matmul(W_abs_sub, grid.T)
+                lut_idx_list.append(torch.argmin(dists_sub, dim=-1).to(torch.int32))
+            lut_idx = torch.cat(lut_idx_list, dim=0)
             
             # 7. Pack into 16-bit combined index (upper 8 bits = signs, lower 8 bits = lut_idx)
             packed_idx = (sign_bits << 8) | lut_idx
@@ -259,7 +264,7 @@ class HIVQEmbedding(torch.nn.Module):
         
         signs = (torch.randint(0, 2, (self.embedding_dim,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0).to(dtype=W.dtype)
         
-        row_chunk_size = 16384
+        row_chunk_size = 4096
         all_scales = []
         all_indices = []
         
@@ -287,9 +292,15 @@ class HIVQEmbedding(torch.nn.Module):
             for b in range(8):
                 sign_bits |= (block_signs[:, b] << b)
                 
-            W_abs = W_blocks.float().abs()
-            dists = (W_abs**2).sum(dim=-1, keepdim=True) + grid_norm_sq.unsqueeze(0) - 2.0 * torch.matmul(W_abs, grid.T)
-            lut_idx = torch.argmin(dists, dim=-1).to(torch.int32)
+            # Map absolute magnitudes to 256-entry E8P grid in micro-batches to cap VRAM
+            W_abs_all = W_blocks.float().abs()
+            block_batch_size = 32768
+            lut_idx_list = []
+            for blk_start in range(0, W_abs_all.shape[0], block_batch_size):
+                W_abs_sub = W_abs_all[blk_start:blk_start + block_batch_size]
+                dists_sub = (W_abs_sub**2).sum(dim=-1, keepdim=True) + grid_norm_sq.unsqueeze(0) - 2.0 * torch.matmul(W_abs_sub, grid.T)
+                lut_idx_list.append(torch.argmin(dists_sub, dim=-1).to(torch.int32))
+            lut_idx = torch.cat(lut_idx_list, dim=0)
             
             packed_idx = (sign_bits << 8) | lut_idx
             all_indices.append(packed_idx.to(device))
