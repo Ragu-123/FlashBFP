@@ -232,11 +232,12 @@ class OABFLinear(torch.nn.Module):
         
         # Cast to universally-supported dtypes BEFORE .to(device)
         # int8 exponents -> float32 (Triton loads as float32 anyway)
-        # int16 signs -> int32 (Triton casts to int32 anyway)
-        # int32 payload stays int32
         self.register_buffer('_dp_exponents', dense_payload['exponents'].to(torch.float32).to(device))
-        self.register_buffer('_dp_signs', dense_payload['signs'].to(torch.int32).to(device))
-        self.register_buffer('_dp_payload', dense_payload['payload'].to(torch.int32).flatten().to(device))
+        
+        # Store integer tensors as standard attributes rather than registered buffers
+        # to prevent Hugging Face Accelerate's AlignDevicesHook from casting them to float16/bfloat16.
+        self._dp_signs = dense_payload['signs'].to(torch.int32).to(device)
+        self._dp_payload = dense_payload['payload'].to(torch.int32).flatten().to(device)
         
         # Store shape metadata (non-tensor, not affected by device moves)
         self._payload_meta = {
@@ -244,13 +245,30 @@ class OABFLinear(torch.nn.Module):
             'orig_shape': dense_payload['orig_shape'],
         }
         
-        # Sparse outlier tensors — also cast to standard dtypes
-        self.register_buffer('_sp_block_idx', sparse_outliers['block_idx'].to(torch.int32).to(device))
-        self.register_buffer('_sp_offset', sparse_outliers['offset'].to(torch.int32).to(device))
+        # Sparse outlier tensors — also stored as standard attributes
+        self._sp_block_idx = sparse_outliers['block_idx'].to(torch.int32).to(device)
+        self._sp_offset = sparse_outliers['offset'].to(torch.int32).to(device)
         self.register_buffer('_sp_value', sparse_outliers['value'].to(torch.float32).to(device))
         self._sparse_meta = {
             'count': sparse_outliers['count'],
         }
+        
+        # Strict CPU-side validation of outlier indices at load time to prevent any CUDA asserts
+        if sparse_outliers['count'] > 0:
+            block_idx_cpu = sparse_outliers['block_idx'].long()
+            offset_cpu = sparse_outliers['offset'].long()
+            padded_R, padded_C = dense_payload['padded_shape']
+            C_orig, R_orig = dense_payload['orig_shape']
+            
+            global_idx_cpu = block_idx_cpu * 16 + offset_cpu
+            row_idx_cpu = global_idx_cpu % padded_R
+            col_idx_cpu = global_idx_cpu // padded_R
+            
+            # Check bounds against padded shape
+            if (row_idx_cpu < 0).any() or (row_idx_cpu >= padded_R).any():
+                raise IndexError(f"FlashBFP Compressor Error: Outlier row index out of padded bounds [0, {padded_R-1}]")
+            if (col_idx_cpu < 0).any() or (col_idx_cpu >= padded_C).any():
+                raise IndexError(f"FlashBFP Compressor Error: Outlier column index out of padded bounds [0, {padded_C-1}]")
         
         self.compressed = True
 
@@ -272,6 +290,13 @@ class OABFLinear(torch.nn.Module):
         # Accelerate's hooks move registered buffers, so trust their location.
         exec_device = self._dp_exponents.device
         
+        # Explicitly move non-buffer attributes to exec_device if needed.
+        # Since they are not registered buffers, Accelerate will not touch them.
+        if self._dp_signs.device != exec_device:
+            self._dp_signs = self._dp_signs.to(exec_device)
+        if self._dp_payload.device != exec_device:
+            self._dp_payload = self._dp_payload.to(exec_device)
+            
         X_flat = X.view(-1, self.in_features)
         
         # Move X to the execution device if accelerate placed them differently
@@ -290,14 +315,17 @@ class OABFLinear(torch.nn.Module):
         if self._sparse_meta['count'] > 0:
             R_padded, C_padded = self._payload_meta['padded_shape']
             
+            # Move outlier attributes to exec_device and cache the location
+            if self._sp_block_idx.device != exec_device:
+                self._sp_block_idx = self._sp_block_idx.to(exec_device)
+            if self._sp_offset.device != exec_device:
+                self._sp_offset = self._sp_offset.to(exec_device)
+                
             outlier_block = self._sp_block_idx
             outlier_offset = self._sp_offset
             outlier_val = self._sp_value
             
-            # Sync outlier tensors to execution device if needed
-            if outlier_block.device != exec_device:
-                outlier_block = outlier_block.to(exec_device)
-                outlier_offset = outlier_offset.to(exec_device)
+            if outlier_val.device != exec_device:
                 outlier_val = outlier_val.to(exec_device)
             
             # Use int64 for ALL index arithmetic to prevent overflow
@@ -309,8 +337,10 @@ class OABFLinear(torch.nn.Module):
             # Strict boundary validation including >= 0 bounds checking
             valid_mask = (row_indices >= 0) & (row_indices < self.in_features) & \
                          (col_indices >= 0) & (col_indices < self.out_features)
-            r_idx = row_indices[valid_mask]
-            c_idx = col_indices[valid_mask]
+            
+            # Ensure integer attributes remain correct type (int64 for indexing)
+            r_idx = row_indices[valid_mask].long()
+            c_idx = col_indices[valid_mask].long()
             v_val = outlier_val[valid_mask].to(X_flat.dtype)
             
             # Ironclad safety clamp to prevent CUDA out-of-bounds indexing assertions
