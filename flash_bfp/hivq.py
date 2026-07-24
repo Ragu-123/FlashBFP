@@ -171,8 +171,8 @@ class HIVQLinear(torch.nn.Module):
         e8_points = conway_sloane_e8(W_norm_grouped)
         
         # 5. Map E8 points to closest codebook index
-        # Use GPU (CUDA) for search if available to accelerate quantization by 1000x!
-        comp_device = device if torch.cuda.is_available() else 'cpu'
+        # Force search on GPU if CUDA is available, then move results back to target device
+        comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         codebook = E8Codebook.get_instance(device=comp_device).codebook
         e8_points = e8_points.to(comp_device)
         
@@ -189,7 +189,7 @@ class HIVQLinear(torch.nn.Module):
             dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook.T) # [B, 65536]
             indices.append(torch.argmin(dists, dim=-1))
             
-        indices = torch.cat(indices, dim=0).to(torch.int32).cpu()
+        indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
         
         # Move buffers to target device
         self.register_buffer('_signs', signs.to(device))
