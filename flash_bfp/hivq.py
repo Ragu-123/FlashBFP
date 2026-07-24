@@ -152,29 +152,27 @@ class HIVQLinear(torch.nn.Module):
             
     def load_from_weight(self, W: torch.Tensor, device="cpu"):
         """Rotates weight using RHT, maps to E8 lattice, and saves compressed representations."""
-        # 1. Generate Rademacher signs
-        signs = torch.randint(0, 2, (self.in_features,), dtype=torch.float32, device='cpu') * 2.0 - 1.0
+        comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # 2. Apply Rademacher signs and forward FWHT
-        W_signed = W.cpu() * signs.unsqueeze(0)
+        # 1. Generate Rademacher signs on GPU
+        signs = torch.randint(0, 2, (self.in_features,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0
+        
+        # 2. Apply Rademacher signs and forward FWHT on GPU
+        W_signed = W.to(comp_device) * signs.unsqueeze(0)
         W_rot = pad_fwht(W_signed)
         
-        # 3. Calculate row-wise scale factors
-        # Scale is chosen to fit the maximum value within E8 codebook shell boundaries
+        # 3. Calculate row-wise scale factors on GPU
         scales = torch.max(torch.abs(W_rot), dim=-1, keepdim=True)[0] / 3.0
         scales = torch.clamp(scales, min=1e-5)
         
         W_norm = W_rot / scales
         
-        # 4. Map 8D blocks to E8
+        # 4. Map 8D blocks to E8 on GPU
         W_norm_grouped = W_norm.view(-1, 8)
         e8_points = conway_sloane_e8(W_norm_grouped)
         
-        # 5. Map E8 points to closest codebook index
-        # Force search on GPU if CUDA is available, then move results back to target device
-        comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 5. Map E8 points to closest codebook index on GPU
         codebook = E8Codebook.get_instance(device=comp_device).codebook
-        e8_points = e8_points.to(comp_device)
         
         # Vectorized nearest neighbor search across the 65536 E8 points using memory-efficient matrix multiplication
         codebook_norms = torch.sum(codebook**2, dim=-1) # [65536]
@@ -191,7 +189,7 @@ class HIVQLinear(torch.nn.Module):
             
         indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
         
-        # Move buffers to target device
+        # Move final buffers to target device (Accelereate managed sharded device)
         self.register_buffer('_signs', signs.to(device))
         self.register_buffer('_scales', scales.squeeze(-1).to(torch.float32).to(device))
         self.register_buffer('_e8_indices', indices.to(device))
