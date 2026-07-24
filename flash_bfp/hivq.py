@@ -72,6 +72,8 @@ class E8Codebook:
     def get_instance(cls, device="cpu"):
         if cls._instance is None:
             cls._instance = cls(device=device)
+        else:
+            cls._instance.to(device)
         return cls._instance
         
     def __init__(self, device="cpu"):
@@ -169,7 +171,10 @@ class HIVQLinear(torch.nn.Module):
         e8_points = conway_sloane_e8(W_norm_grouped)
         
         # 5. Map E8 points to closest codebook index
-        codebook = E8Codebook.get_instance(device='cpu').codebook
+        # Use GPU (CUDA) for search if available to accelerate quantization by 1000x!
+        comp_device = device if torch.cuda.is_available() else 'cpu'
+        codebook = E8Codebook.get_instance(device=comp_device).codebook
+        e8_points = e8_points.to(comp_device)
         
         # Vectorized nearest neighbor search across the 65536 E8 points using memory-efficient matrix multiplication
         codebook_norms = torch.sum(codebook**2, dim=-1) # [65536]
@@ -184,7 +189,7 @@ class HIVQLinear(torch.nn.Module):
             dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook.T) # [B, 65536]
             indices.append(torch.argmin(dists, dim=-1))
             
-        indices = torch.cat(indices, dim=0).to(torch.int32)
+        indices = torch.cat(indices, dim=0).to(torch.int32).cpu()
         
         # Move buffers to target device
         self.register_buffer('_signs', signs.to(device))
@@ -200,24 +205,33 @@ class HIVQLinear(torch.nn.Module):
         orig_shape = X.shape
         X = X.view(-1, self.in_features)
         
+        # Cast/move buffers to match input device and dtype (float32/bfloat16) on-the-fly to support device_map='auto'
+        device = X.device
+        dtype = X.dtype
+        
+        signs = self._signs.to(device=device, dtype=dtype)
+        scales = self._scales.to(device=device, dtype=dtype)
+        e8_indices = self._e8_indices.to(device=device)
+        
         # 1. Apply Rademacher-Hadamard rotation to activation inputs
-        X_signed = X * self._signs.unsqueeze(0)
+        X_signed = X * signs.unsqueeze(0)
         X_rot = pad_fwht(X_signed)
         
         # 2. Dequantize weights from 16-bit indices on-the-fly using E8 codebook
-        codebook = E8Codebook.get_instance(device=X.device).codebook
-        W_dequant = codebook[self._e8_indices.long()] # [out_features * in_features // 8, 8]
+        codebook = E8Codebook.get_instance(device=device).codebook.to(dtype=dtype)
+        W_dequant = codebook[e8_indices.long()] # [out_features * in_features // 8, 8]
         W_dequant = W_dequant.view(self.out_features, self.in_features)
         
         # Scale dequantized weights row-wise
-        W_dequant = W_dequant * self._scales.unsqueeze(-1)
+        W_dequant = W_dequant * scales.unsqueeze(-1)
         
         # 3. Perform rotated GEMM
         Y_rot = torch.nn.functional.linear(X_rot, W_dequant)
         
         # 4. Add bias
         if self.bias is not None:
-            Y_rot = Y_rot + self.bias
+            bias_cast = self.bias.to(device=device, dtype=dtype)
+            Y_rot = Y_rot + bias_cast
             
         return Y_rot.view(*orig_shape[:-1], self.out_features)
         
