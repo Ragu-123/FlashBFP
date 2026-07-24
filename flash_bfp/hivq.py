@@ -171,13 +171,17 @@ class HIVQLinear(torch.nn.Module):
         # 5. Map E8 points to closest codebook index
         codebook = E8Codebook.get_instance(device='cpu').codebook
         
-        # Vectorized nearest neighbor search across the 65536 E8 points
-        # Using a fast block loop to prevent out-of-memory errors on large dimensions
+        # Vectorized nearest neighbor search across the 65536 E8 points using memory-efficient matrix multiplication
+        codebook_norms = torch.sum(codebook**2, dim=-1) # [65536]
+        
         indices = []
-        batch_size = 8192
+        batch_size = 1024  # Keep batch size small to limit memory allocation below 300MB
         for i in range(0, e8_points.shape[0], batch_size):
-            block = e8_points[i:i+batch_size].unsqueeze(1) # [B, 1, 8]
-            dists = torch.sum((block - codebook.unsqueeze(0))**2, dim=-1) # [B, 65536]
+            block = e8_points[i:i+batch_size] # [B, 8]
+            block_norms = torch.sum(block**2, dim=-1, keepdim=True) # [B, 1]
+            
+            # Distance expansion: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
+            dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook.T) # [B, 65536]
             indices.append(torch.argmin(dists, dim=-1))
             
         indices = torch.cat(indices, dim=0).to(torch.int32)
