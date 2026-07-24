@@ -134,7 +134,7 @@ class HIVQLinear(torch.nn.Module):
                 sign_bits |= (block_signs[:, b] << b)
                 
             # 6. Map absolute magnitudes to 256-entry E8P grid
-            W_abs = W_blocks.abs()
+            W_abs = W_blocks.float().abs()
             dists = (W_abs**2).sum(dim=-1, keepdim=True) + grid_norm_sq.unsqueeze(0) - 2.0 * torch.matmul(W_abs, grid.T)
             lut_idx = torch.argmin(dists, dim=-1).to(torch.int32) # [blocks]
             
@@ -287,7 +287,7 @@ class HIVQEmbedding(torch.nn.Module):
             for b in range(8):
                 sign_bits |= (block_signs[:, b] << b)
                 
-            W_abs = W_blocks.abs()
+            W_abs = W_blocks.float().abs()
             dists = (W_abs**2).sum(dim=-1, keepdim=True) + grid_norm_sq.unsqueeze(0) - 2.0 * torch.matmul(W_abs, grid.T)
             lut_idx = torch.argmin(dists, dim=-1).to(torch.int32)
             
