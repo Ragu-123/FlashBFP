@@ -409,15 +409,41 @@ class HIVQEmbedding(torch.nn.Module):
         device = input_ids.device
         dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
         
-        W = self.materialize_weight(device, dtype)
+        D = self.embedding_dim
+        N_in = D if (D & (D - 1)) == 0 else 2 ** ((D - 1).bit_length())
+        block_size = N_in // 8
         
-        # Standard fast embedding lookup!
-        out = torch.nn.functional.embedding(input_ids, W, padding_idx=self.padding_idx)
+        signs = self._signs.to(device=device, dtype=dtype)
+        scales = self._scales.to(device=device, dtype=dtype)
+        e8_indices = self._e8_indices.to(device=device)
+        
+        flat_ids = input_ids.view(-1)
+        
+        # Vectorized gather of contiguous E8 indices for target token IDs
+        offsets = torch.arange(block_size, device=device).unsqueeze(0) # [1, block_size]
+        token_offsets = flat_ids.unsqueeze(1) * block_size # [num_tokens, 1]
+        gather_indices = (token_offsets + offsets).view(-1) # [num_tokens * block_size]
+        
+        token_e8_indices = torch.index_select(e8_indices, 0, gather_indices) # [num_tokens * block_size]
+        
+        # Dequantize E8 points using E8 codebook lookup
+        codebook = E8Codebook.get_instance(device=device).codebook.to(dtype=dtype)
+        token_vectors = codebook[token_e8_indices.long()] # [num_tokens * block_size, 8]
+        token_vectors = token_vectors.view(-1, N_in) # [num_tokens, N_in]
+        
+        # Scale dequantized vectors row-wise
+        token_scales = torch.index_select(scales, 0, flat_ids) # [num_tokens]
+        token_vectors = token_vectors * token_scales.unsqueeze(-1)
+        
+        # Apply inverse Rademacher-Hadamard rotation online (fwht of N_in, then truncate back and apply signs)
+        W_rot = fwht(token_vectors)
+        x_rot = W_rot[..., :D] * signs.unsqueeze(0)
         
         # Apply embed_scale!
         if self.embed_scale != 1.0:
-            out = out * self.embed_scale
-        return out
+            x_rot = x_rot * self.embed_scale
+            
+        return x_rot.view(*input_ids.shape, self.embedding_dim)
         
     def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
         state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
