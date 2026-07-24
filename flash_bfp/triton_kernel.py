@@ -57,44 +57,28 @@ def oabf_gemm_kernel(
         # Total number of blocks in the compressed payload
         num_k_blocks = K // 16
         
-        w_tile = None
+        # Fully vectorized 2D unpack over all BLOCK_SIZE_K rows at once (no loops, no tl.cat)
+        local_row = tl.arange(0, BLOCK_SIZE_K)[:, None]                     # (BLOCK_SIZE_K, 1)
+        step = local_row // 16                                              # (BLOCK_SIZE_K, 1)
+        k_block = k * (BLOCK_SIZE_K // 16) + step                           # (BLOCK_SIZE_K, 1)
+        block_idx = offs_bn[None, :] * num_k_blocks + k_block               # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         
-        for step in range(0, BLOCK_SIZE_K // 16):
-            k_block = k * (BLOCK_SIZE_K // 16) + step
-            block_idx = offs_bn[None, :] * num_k_blocks + k_block
-            
-            # Bounds mask: prevent reading past the payload buffer
-            b_mask = (offs_bn[None, :] < N) & (k_block < num_k_blocks)
-            
-            exp = tl.load(exponents_ptr + block_idx, mask=b_mask, other=0.0).to(tl.float32)
-            signs = tl.load(signs_ptr + block_idx, mask=b_mask, other=0).to(tl.int32)
-            
-            p_mask = b_mask  # Same mask for payload (2 words per block)
-            p_word1 = tl.load(payload_ptr + block_idx * 2, mask=p_mask, other=0)
-            p_word2 = tl.load(payload_ptr + block_idx * 2 + 1, mask=p_mask, other=0)
-            
-            # Vectorized bitwise unpacking of 16 elements per block
-            shift_matrix = tl.arange(0, 8)[:, None] * 4
-            i_arr = tl.arange(0, 8)[:, None]
-            
-            # Unpack first 8 mantissas and signs
-            mantissas1 = (p_word1 >> shift_matrix) & 0xF
-            signs1 = (signs >> i_arr) & 1
-            val1 = tl.where(signs1 == 1, -1.0, 1.0) * (mantissas1.to(tl.float32) / 15.0) * tl.exp2(exp)
-            
-            # Unpack second 8 mantissas and signs
-            mantissas2 = (p_word2 >> shift_matrix) & 0xF
-            signs2 = (signs >> (i_arr + 8)) & 1
-            val2 = tl.where(signs2 == 1, -1.0, 1.0) * (mantissas2.to(tl.float32) / 15.0) * tl.exp2(exp)
-            
-            # Concatenate along the row dimension to get a (16, BLOCK_SIZE_N) block
-            val_block = tl.cat(val1, val2)
-            
-            if w_tile is None:
-                w_tile = val_block
-            else:
-                w_tile = tl.cat(w_tile, val_block)
-                
+        b_mask = (offs_bn[None, :] < N) & (k_block < num_k_blocks)          # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        
+        exp = tl.load(exponents_ptr + block_idx, mask=b_mask, other=0.0).to(tl.float32)       # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        signs = tl.load(signs_ptr + block_idx, mask=b_mask, other=0).to(tl.int32)              # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        p_word1 = tl.load(payload_ptr + block_idx * 2, mask=b_mask, other=0)                   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        p_word2 = tl.load(payload_ptr + block_idx * 2 + 1, mask=b_mask, other=0)               # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        
+        use_word2 = (local_row % 16) >= 8                                   # (BLOCK_SIZE_K, 1)
+        shift = ((local_row % 16) % 8) * 4                                  # (BLOCK_SIZE_K, 1)
+        
+        word_sel = tl.where(use_word2, p_word2, p_word1)                    # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        mantissa = (word_sel >> shift) & 0xF                                # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        
+        sign_bit = (signs >> (local_row % 16)) & 1                          # (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        w_tile = tl.where(sign_bit == 1, -1.0, 1.0) * (mantissa.to(tl.float32) / 15.0) * tl.exp2(exp)
+        
         accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
     c_ptr = y_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
