@@ -182,10 +182,25 @@ def compress_gemma_model_hivq(model):
             W = torch.zeros(W.shape, dtype=W.dtype, device='cpu')
         hivq_layer.load_from_weight(W, device=target_device)
         setattr(parent_module, sub_name, hivq_layer)
-        del original_linear
+    linear_layers.clear()
+    embedding_layers.clear()
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         
     print("\nGemma 4 model compression to 2-bit completed successfully! All core layers (linear & embedding) are now running HIVQ.")
     return model
+
+
+def clean_gpu_memory():
+    """Utility to force garbage collection and release all unallocated PyTorch CUDA memory."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def load_gemma_model_hivq_skeleton(model):
