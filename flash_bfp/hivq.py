@@ -272,6 +272,31 @@ class HIVQLinear(torch.nn.Module):
                                       missing_keys, unexpected_keys, error_msgs)
         self.compressed = True
 
+    @property
+    def weight(self) -> torch.Tensor:
+        """Dynamically dequantizes and reconstructs the full weight matrix on-the-fly."""
+        if not self.compressed:
+            raise RuntimeError("Linear layer has not been compressed.")
+            
+        device = self._e8_indices.device
+        dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+        
+        signs = self._signs.to(device=device, dtype=dtype)
+        scales = self._scales.to(device=device, dtype=dtype)
+        e8_indices = self._e8_indices.to(device=device)
+        
+        # Dequantize weights from indices using E8 codebook
+        codebook = E8Codebook.get_instance(device=device).codebook.to(dtype=dtype)
+        W_dequant = codebook[e8_indices.long()] # [out_features * in_features // 8, 8]
+        W_dequant = W_dequant.view(self.out_features, self.in_features)
+        
+        # Scale dequantized weights row-wise
+        W_dequant = W_dequant * scales.unsqueeze(-1)
+        
+        # Apply inverse Rademacher-Hadamard rotation: W = ifwht(W_dequant) * signs
+        W_rot = pad_ifwht(W_dequant) * signs.unsqueeze(0)
+        return W_rot
+
 
 class HIVQEmbedding(torch.nn.Module):
     """Embedding layer using 2-bit E8 lattice vector quantization and Rademacher-Hadamard rotation."""
@@ -406,3 +431,28 @@ class HIVQEmbedding(torch.nn.Module):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
         self.compressed = True
+
+    @property
+    def weight(self) -> torch.Tensor:
+        """Dynamically dequantizes and reconstructs the full weight matrix on-the-fly."""
+        if not self.compressed:
+            raise RuntimeError("Embedding has not been compressed.")
+            
+        device = self._e8_indices.device
+        dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+        
+        signs = self._signs.to(device=device, dtype=dtype)
+        scales = self._scales.to(device=device, dtype=dtype)
+        e8_indices = self._e8_indices.to(device=device)
+        
+        # Dequantize E8 points using codebook lookup
+        codebook = E8Codebook.get_instance(device=device).codebook.to(dtype=dtype)
+        W_dequant = codebook[e8_indices.long()] # [num_embeddings * embedding_dim // 8, 8]
+        W_dequant = W_dequant.view(self.num_embeddings, self.embedding_dim)
+        
+        # Scale dequantized weights row-wise
+        W_dequant = W_dequant * scales.unsqueeze(-1)
+        
+        # Apply inverse Walsh-Hadamard Transform and signs
+        W_rot = pad_ifwht(W_dequant) * signs.unsqueeze(0)
+        return W_rot
