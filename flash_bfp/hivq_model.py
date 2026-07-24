@@ -97,10 +97,17 @@ def compress_gemma_model_hivq(model):
         else:
             target_device = weight_device
             
+        embed_scale = 1.0
+        if hasattr(original_emb, "embed_scale"):
+            embed_scale = original_emb.embed_scale.item()
+        elif hasattr(original_emb, "scalar_embed_scale"):
+            embed_scale = original_emb.scalar_embed_scale
+            
         hivq_emb = HIVQEmbedding(
             num_embeddings=original_emb.num_embeddings,
             embedding_dim=original_emb.embedding_dim,
-            padding_idx=original_emb.padding_idx
+            padding_idx=original_emb.padding_idx,
+            embed_scale=embed_scale
         )
         
         hivq_emb = hivq_emb.to(target_device)
@@ -171,10 +178,17 @@ def load_gemma_model_hivq_skeleton(model):
         
     # 2. Swap Embedding Layers
     for parent_module, sub_name, original_emb, full_name in embedding_layers:
+        embed_scale = 1.0
+        if hasattr(original_emb, "embed_scale"):
+            embed_scale = original_emb.embed_scale.item()
+        elif hasattr(original_emb, "scalar_embed_scale"):
+            embed_scale = original_emb.scalar_embed_scale
+            
         hivq_emb = HIVQEmbedding(
             num_embeddings=original_emb.num_embeddings,
             embedding_dim=original_emb.embedding_dim,
-            padding_idx=original_emb.padding_idx
+            padding_idx=original_emb.padding_idx,
+            embed_scale=embed_scale
         )
         setattr(parent_module, sub_name, hivq_emb)
         

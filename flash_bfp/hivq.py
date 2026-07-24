@@ -296,13 +296,14 @@ class HIVQLinear(torch.nn.Module):
 
 class HIVQEmbedding(torch.nn.Module):
     """Embedding layer using 2-bit E8 lattice vector quantization and Rademacher-Hadamard rotation."""
-    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int = None):
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int = None, embed_scale: float = 1.0):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.compressed = False
         self._cached_weight = None
+        self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=False)
         
         # Register empty buffers for state dict loading/resizing
         self.register_buffer('_signs', torch.empty(0, dtype=torch.float32))
@@ -411,7 +412,12 @@ class HIVQEmbedding(torch.nn.Module):
         W = self.materialize_weight(device, dtype)
         
         # Standard fast embedding lookup!
-        return torch.nn.functional.embedding(input_ids, W, padding_idx=self.padding_idx)
+        out = torch.nn.functional.embedding(input_ids, W, padding_idx=self.padding_idx)
+        
+        # Apply embed_scale!
+        if self.embed_scale != 1.0:
+            out = out * self.embed_scale
+        return out
         
     def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
         state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
