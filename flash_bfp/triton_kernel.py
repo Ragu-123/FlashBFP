@@ -54,19 +54,16 @@ def oabf_gemm_kernel(
         a_mask = (offs_am[:, None] < M) & (a_offs_k[None, :] < K)
         a_tile = tl.load(a_ptr, mask=a_mask, other=0.0)
         
-        w_tile = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
-        
         # Total number of blocks in the compressed payload
         num_k_blocks = K // 16
+        
+        w_tile = None
         
         for step in range(0, BLOCK_SIZE_K // 16):
             k_block = k * (BLOCK_SIZE_K // 16) + step
             block_idx = offs_bn[None, :] * num_k_blocks + k_block
             
             # Bounds mask: prevent reading past the payload buffer
-            # Max valid block_idx = (C_padded - 1) * num_k_blocks + (num_k_blocks - 1)
-            # = C_padded * num_k_blocks - 1 = total_blocks - 1
-            total_blocks = N * num_k_blocks
             b_mask = (offs_bn[None, :] < N) & (k_block < num_k_blocks)
             
             exp = tl.load(exponents_ptr + block_idx, mask=b_mask, other=0.0).to(tl.float32)
@@ -76,21 +73,27 @@ def oabf_gemm_kernel(
             p_word1 = tl.load(payload_ptr + block_idx * 2, mask=p_mask, other=0)
             p_word2 = tl.load(payload_ptr + block_idx * 2 + 1, mask=p_mask, other=0)
             
-            for i in range(8):
-                mantissa = (p_word1 >> (i * 4)) & 0xF
-                sign = (signs >> i) & 1
-                val = tl.where(sign == 1, -1.0, 1.0) * (mantissa.to(tl.float32) / 15.0) * tl.exp2(exp)
-                
-                row_idx = step * 16 + i
-                w_tile = tl.where(tl.arange(0, BLOCK_SIZE_K)[:, None] == row_idx, val, w_tile)
-                
-            for i in range(8):
-                mantissa = (p_word2 >> (i * 4)) & 0xF
-                sign = (signs >> (i + 8)) & 1
-                val = tl.where(sign == 1, -1.0, 1.0) * (mantissa.to(tl.float32) / 15.0) * tl.exp2(exp)
-                
-                row_idx = step * 16 + i + 8
-                w_tile = tl.where(tl.arange(0, BLOCK_SIZE_K)[:, None] == row_idx, val, w_tile)
+            # Vectorized bitwise unpacking of 16 elements per block
+            shift_matrix = tl.arange(0, 8)[:, None] * 4
+            i_arr = tl.arange(0, 8)[:, None]
+            
+            # Unpack first 8 mantissas and signs
+            mantissas1 = (p_word1 >> shift_matrix) & 0xF
+            signs1 = (signs >> i_arr) & 1
+            val1 = tl.where(signs1 == 1, -1.0, 1.0) * (mantissas1.to(tl.float32) / 15.0) * tl.exp2(exp)
+            
+            # Unpack second 8 mantissas and signs
+            mantissas2 = (p_word2 >> shift_matrix) & 0xF
+            signs2 = (signs >> (i_arr + 8)) & 1
+            val2 = tl.where(signs2 == 1, -1.0, 1.0) * (mantissas2.to(tl.float32) / 15.0) * tl.exp2(exp)
+            
+            # Concatenate along the row dimension to get a (16, BLOCK_SIZE_N) block
+            val_block = tl.cat(val1, val2, dim=0)
+            
+            if w_tile is None:
+                w_tile = val_block
+            else:
+                w_tile = tl.cat(w_tile, val_block, dim=0)
                 
         accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
@@ -156,22 +159,29 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     
     target_device = X.device
     
-    # --- Explicit device sync + contiguous for ALL tensors ---
+    # --- Fast-path device/contiguous checks to avoid redundant allocations ---
     try:
-        exponents = dense_payload['exponents'].to(device=target_device, dtype=torch.float32).contiguous()
-        signs = dense_payload['signs'].to(device=target_device, dtype=torch.int32).contiguous()
-        payload_raw = dense_payload['payload'].to(device=target_device, dtype=torch.int32).contiguous()
-        # Flatten payload to 1D for direct pointer arithmetic in the kernel
-        payload_flat = payload_raw.flatten().contiguous()
+        exponents = dense_payload['exponents']
+        if exponents.device != target_device or exponents.dtype != torch.float32 or not exponents.is_contiguous():
+            exponents = exponents.to(device=target_device, dtype=torch.float32).contiguous()
+            
+        signs = dense_payload['signs']
+        if signs.device != target_device or signs.dtype != torch.int32 or not signs.is_contiguous():
+            signs = signs.to(device=target_device, dtype=torch.int32).contiguous()
+            
+        payload = dense_payload['payload']
+        if payload.device != target_device or payload.dtype != torch.int32 or not payload.is_contiguous():
+            payload = payload.to(device=target_device, dtype=torch.int32).contiguous()
     except RuntimeError:
         # If .to(cuda) fails for any reason (unsupported dtype, OOM, etc.), use CPU fallback
         return _cpu_fallback_gemm(X, dense_payload)
     
     # Verify ALL tensors are actually on CUDA before launching kernel
-    if not (exponents.is_cuda and signs.is_cuda and payload_flat.is_cuda):
+    if not (exponents.is_cuda and signs.is_cuda and payload.is_cuda):
         return _cpu_fallback_gemm(X, dense_payload)
     
-    X = X.contiguous()
+    if not X.is_contiguous():
+        X = X.contiguous()
     
     M, K_x = X.shape
     R_padded, C_padded = dense_payload['padded_shape']
@@ -189,7 +199,7 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
             X, Y,
             exponents,
             signs,
-            payload_flat,
+            payload,
             M, C_padded, R_padded,
             X.stride(0), X.stride(1),
             Y.stride(0), Y.stride(1),
@@ -248,14 +258,12 @@ class OABFLinear(torch.nn.Module):
         }
         
         # Sparse outlier tensors — also stored as standard attributes
-        self._sp_block_idx = sparse_outliers['block_idx'].to(torch.int32).to(device)
-        self._sp_offset = sparse_outliers['offset'].to(torch.int32).to(device)
         self.register_buffer('_sp_value', sparse_outliers['value'].to(torch.float32).to(device))
         self._sparse_meta = {
             'count': sparse_outliers['count'],
         }
         
-        # Strict CPU-side validation of outlier indices at load time to prevent any CUDA asserts
+        # Pre-compute and cache index tensors for SpMV path to avoid recalculating on every forward pass
         if sparse_outliers['count'] > 0:
             block_idx_cpu = sparse_outliers['block_idx'].long()
             offset_cpu = sparse_outliers['offset'].long()
@@ -266,11 +274,33 @@ class OABFLinear(torch.nn.Module):
             row_idx_cpu = global_idx_cpu % padded_R
             col_idx_cpu = global_idx_cpu // padded_R
             
-            # Check bounds against padded shape
+            # CPU-side boundary validation
             if (row_idx_cpu < 0).any() or (row_idx_cpu >= padded_R).any():
                 raise IndexError(f"FlashBFP Compressor Error: Outlier row index out of padded bounds [0, {padded_R-1}]")
             if (col_idx_cpu < 0).any() or (col_idx_cpu >= padded_C).any():
                 raise IndexError(f"FlashBFP Compressor Error: Outlier column index out of padded bounds [0, {padded_C-1}]")
+                
+            # Filter outliers belonging to valid active features
+            valid_mask = (row_idx_cpu >= 0) & (row_idx_cpu < self.in_features) & \
+                         (col_idx_cpu >= 0) & (col_idx_cpu < self.out_features)
+                         
+            r_idx_cpu = row_idx_cpu[valid_mask].long()
+            c_idx_cpu = col_idx_cpu[valid_mask].long()
+            v_val_cpu = sparse_outliers['value'][valid_mask].to(torch.float32)
+            
+            # Ironclad safety clamp
+            if c_idx_cpu.numel() > 0:
+                c_idx_cpu = torch.clamp(c_idx_cpu, 0, self.out_features - 1)
+                r_idx_cpu = torch.clamp(r_idx_cpu, 0, self.in_features - 1)
+                
+            # Store cached GPU/device tensors as standard attributes (not registered buffers)
+            self._sp_r_idx = r_idx_cpu.to(device)
+            self._sp_c_idx = c_idx_cpu.to(device)
+            self._sp_v_val = v_val_cpu.to(device)
+        else:
+            self._sp_r_idx = None
+            self._sp_c_idx = None
+            self._sp_v_val = None
         
         self.compressed = True
 
@@ -289,11 +319,9 @@ class OABFLinear(torch.nn.Module):
         input_device = X.device
         
         # Determine execution device: use our buffer's device as truth.
-        # Accelerate's hooks move registered buffers, so trust their location.
         exec_device = self._dp_exponents.device
         
         # Explicitly move non-buffer attributes to exec_device if needed.
-        # Since they are not registered buffers, Accelerate will not touch them.
         if self._dp_signs.device != exec_device:
             self._dp_signs = self._dp_signs.to(exec_device)
         if self._dp_payload.device != exec_device:
@@ -314,50 +342,25 @@ class OABFLinear(torch.nn.Module):
         }
         Y_dense = oabf_gemm(X_flat, live_payload)
         
-        if self._sparse_meta['count'] > 0:
-            R_padded, C_padded = self._payload_meta['padded_shape']
-            
-            # Move outlier attributes to exec_device and cache the location
-            if self._sp_block_idx.device != exec_device:
-                self._sp_block_idx = self._sp_block_idx.to(exec_device)
-            if self._sp_offset.device != exec_device:
-                self._sp_offset = self._sp_offset.to(exec_device)
+        # Fast Outlier SpMV Path using Cached GPU Indices
+        if self._sparse_meta['count'] > 0 and self._sp_r_idx is not None:
+            # Sync pre-computed attributes to exec_device if needed
+            if self._sp_r_idx.device != exec_device:
+                self._sp_r_idx = self._sp_r_idx.to(exec_device)
+                self._sp_c_idx = self._sp_c_idx.to(exec_device)
+                self._sp_v_val = self._sp_v_val.to(exec_device)
                 
-            outlier_block = self._sp_block_idx
-            outlier_offset = self._sp_offset
-            outlier_val = self._sp_value
+            r_idx = self._sp_r_idx
+            c_idx = self._sp_c_idx
+            v_val = self._sp_v_val.to(X_flat.dtype)
             
-            if outlier_val.device != exec_device:
-                outlier_val = outlier_val.to(exec_device)
-            
-            # Use int64 for ALL index arithmetic to prevent overflow
-            # on large layers (MLP gate/up/down have 82M+ elements)
-            global_indices = outlier_block.long() * 16 + outlier_offset.long()
-            row_indices = global_indices % R_padded
-            col_indices = global_indices // R_padded
-            
-            # Strict boundary validation including >= 0 bounds checking
-            valid_mask = (row_indices >= 0) & (row_indices < self.in_features) & \
-                         (col_indices >= 0) & (col_indices < self.out_features)
-            
-            # Ensure integer attributes remain correct type (int64 for indexing)
-            r_idx = row_indices[valid_mask].long()
-            c_idx = col_indices[valid_mask].long()
-            v_val = outlier_val[valid_mask].to(X_flat.dtype)
-            
-            # Ironclad safety clamp to prevent CUDA out-of-bounds indexing assertions
             if c_idx.numel() > 0:
-                c_idx = torch.clamp(c_idx, 0, self.out_features - 1)
-                r_idx = torch.clamp(r_idx, 0, self.in_features - 1)
-            
-            X_active = X_flat[:, r_idx]
-            products = X_active * v_val[None, :]
-            
-            Y_sparse = torch.zeros_like(Y_dense)
-            if c_idx.numel() > 0:
+                X_active = X_flat[:, r_idx]
+                products = X_active * v_val[None, :]
+                
+                Y_sparse = torch.zeros_like(Y_dense)
                 Y_sparse.index_add_(1, c_idx, products)
-            
-            Y_dense = Y_dense + Y_sparse
+                Y_dense = Y_dense + Y_sparse
             
         if self.bias is not None:
             bias = self.bias
