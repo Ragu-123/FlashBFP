@@ -291,16 +291,24 @@ class OABFLinear(torch.nn.Module):
             row_indices = global_indices % R_padded
             col_indices = global_indices // R_padded
             
-            valid_mask = (row_indices < self.in_features) & (col_indices < self.out_features)
+            # Strict boundary validation including >= 0 bounds checking
+            valid_mask = (row_indices >= 0) & (row_indices < self.in_features) & \
+                         (col_indices >= 0) & (col_indices < self.out_features)
             r_idx = row_indices[valid_mask]
             c_idx = col_indices[valid_mask]
             v_val = outlier_val[valid_mask].to(X_flat.dtype)
+            
+            # Ironclad safety clamp to prevent CUDA out-of-bounds indexing assertions
+            if c_idx.numel() > 0:
+                c_idx = torch.clamp(c_idx, 0, self.out_features - 1)
+                r_idx = torch.clamp(r_idx, 0, self.in_features - 1)
             
             X_active = X_flat[:, r_idx]
             products = X_active * v_val[None, :]
             
             Y_sparse = torch.zeros_like(Y_dense)
-            Y_sparse.index_add_(1, c_idx, products)
+            if c_idx.numel() > 0:
+                Y_sparse.index_add_(1, c_idx, products)
             
             Y_dense = Y_dense + Y_sparse
             
