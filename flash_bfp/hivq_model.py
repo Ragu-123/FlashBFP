@@ -33,9 +33,11 @@ def compress_gemma_model_hivq(model):
                     "mlp" in full_name or
                     "feed_forward" in full_name or
                     "lconv1d" in full_name or
-                    "per_layer" in full_name or
                     "lm_head" in full_name
                 )
+                if "per_layer" in full_name:
+                    print(f"Skipping compression of sensitive per-layer routing projection: {full_name}")
+                    continue
                 if not is_target_layer:
                     print(f"Skipping compression of auxiliary/sensitive layer: {full_name}")
                     continue
@@ -48,7 +50,10 @@ def compress_gemma_model_hivq(model):
                     
                 linear_layers.append((module, sub_name, sub_module, full_name))
             elif isinstance(sub_module, torch.nn.Embedding) or "embedding" in sub_module.__class__.__name__.lower():
-                # Compress target vocab embeddings
+                # Compress target main vocab embeddings, but skip delicate per-layer embedding routing table
+                if "embed_tokens_per_layer" in full_name:
+                    print(f"Skipping compression of sensitive per-layer embedding table: {full_name}")
+                    continue
                 is_target_emb = "embed_tokens" in full_name or "embedding" in full_name.lower()
                 if is_target_emb:
                     embedding_layers.append((module, sub_name, sub_module, full_name))
@@ -213,15 +218,18 @@ def load_gemma_model_hivq_skeleton(model):
                     "mlp" in full_name or
                     "feed_forward" in full_name or
                     "lconv1d" in full_name or
-                    "per_layer" in full_name or
                     "lm_head" in full_name
                 )
+                if "per_layer" in full_name:
+                    continue
                 if is_target_layer:
                     if tie_word_embeddings and "lm_head" in full_name:
                         lm_head_info = (module, sub_name, sub_module, full_name)
                     else:
                         linear_layers.append((module, sub_name, sub_module, full_name))
             elif isinstance(sub_module, torch.nn.Embedding) or "embedding" in sub_module.__class__.__name__.lower():
+                if "embed_tokens_per_layer" in full_name:
+                    continue
                 is_target_emb = "embed_tokens" in full_name or "embedding" in full_name.lower()
                 if is_target_emb:
                     embedding_layers.append((module, sub_name, sub_module, full_name))
