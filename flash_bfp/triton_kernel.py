@@ -206,6 +206,10 @@ class OABFLinear(torch.nn.Module):
         self._payload_meta = {}
         self._sparse_meta = {}
         
+        # Register empty placeholder buffers for serialization mapping
+        self.register_buffer('_dp_exponents', torch.empty(0, dtype=torch.float32))
+        self.register_buffer('_sp_value', torch.empty(0, dtype=torch.float32))
+        
         if bias:
             self.bias = torch.nn.Parameter(torch.zeros(out_features))
         else:
@@ -362,3 +366,58 @@ class OABFLinear(torch.nn.Module):
             Y_dense = Y_dense.to(input_device)
             
         return Y_dense.view(*orig_shape[:-1], self.out_features)
+
+    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+        if self.compressed:
+            state[prefix + '_dp_signs'] = self._dp_signs
+            state[prefix + '_dp_payload'] = self._dp_payload
+            if self._sp_r_idx is not None:
+                state[prefix + '_sp_r_idx'] = self._sp_r_idx
+                state[prefix + '_sp_c_idx'] = self._sp_c_idx
+                state[prefix + '_sp_v_val'] = self._sp_v_val
+        return state
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        dp_signs_key = prefix + '_dp_signs'
+        dp_payload_key = prefix + '_dp_payload'
+        sp_r_idx_key = prefix + '_sp_r_idx'
+        sp_c_idx_key = prefix + '_sp_c_idx'
+        sp_v_val_key = prefix + '_sp_v_val'
+        
+        if dp_signs_key in state_dict:
+            self._dp_signs = state_dict.pop(dp_signs_key).to(torch.int32)
+        if dp_payload_key in state_dict:
+            self._dp_payload = state_dict.pop(dp_payload_key).to(torch.int32)
+            
+        if sp_r_idx_key in state_dict:
+            self._sp_r_idx = state_dict.pop(sp_r_idx_key).long()
+            self._sp_c_idx = state_dict.pop(sp_c_idx_key).long()
+            self._sp_v_val = state_dict.pop(sp_v_val_key).to(torch.float32)
+            self._sparse_meta = {'count': self._sp_r_idx.numel()}
+        else:
+            self._sp_r_idx = None
+            self._sp_c_idx = None
+            self._sp_v_val = None
+            self._sparse_meta = {'count': 0}
+            
+        # Reconstruct shape metadata from class dimensions
+        C_padded = self.out_features + (64 - self.out_features % 64) % 64
+        R_padded = self.in_features + (16 - self.in_features % 16) % 16
+        self._payload_meta = {
+            'padded_shape': (R_padded, C_padded),
+            'orig_shape': (self.out_features, self.in_features)
+        }
+        
+        # Prevent PyTorch size mismatch by dynamically allocating buffers to match checkpoint shape
+        exponents_key = prefix + '_dp_exponents'
+        sp_value_key = prefix + '_sp_value'
+        if exponents_key in state_dict:
+            self._dp_exponents = torch.empty_like(state_dict[exponents_key])
+        if sp_value_key in state_dict:
+            self._sp_value = torch.empty_like(state_dict[sp_value_key])
+            
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+        self.compressed = True
