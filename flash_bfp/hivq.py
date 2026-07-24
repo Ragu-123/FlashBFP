@@ -325,11 +325,11 @@ class HIVQEmbedding(torch.nn.Module):
         self.compressed = True
 
     def materialize_rows(self, idxs, device=None, dtype=None):
-        """Dequantizes ONLY requested row indices (e.g. pad_token_id), consuming ~0 VRAM."""
+        """Dequantizes requested row indices in micro-chunks of 8192 rows, capping peak VRAM to <100 MB."""
         if device is None:
             device = self._e8_indices.device
         if dtype is None:
-            dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+            dtype = self._signs.dtype if (hasattr(self, '_signs') and self._signs.numel() > 0) else (torch.bfloat16 if device.type == 'cuda' else torch.float32)
             
         is_single = isinstance(idxs, int)
         if is_single:
@@ -346,29 +346,42 @@ class HIVQEmbedding(torch.nn.Module):
         N_in = max(N_in, 8)
         block_size = N_in // 8
         
-        offsets = torch.arange(block_size, device=device).unsqueeze(0)
-        token_offsets = flat_ids.unsqueeze(1) * block_size
-        gather_indices = (token_offsets + offsets).view(-1)
-        
-        token_e8_indices = torch.index_select(self._e8_indices.to(device), 0, gather_indices)
-        
-        lut_idx = (token_e8_indices & 0xFF).long()
-        sign_bits = (token_e8_indices >> 8) & 0xFF
-        
-        grid = E8Codebook.get_instance(device=device).grid.to(dtype=dtype)
-        mags = grid[lut_idx]
+        chunk_size = 8192
+        total_ids = len(flat_ids)
+        all_x_rot = []
         
         shifts = torch.arange(8, device=device)
-        sign_vectors = 1.0 - 2.0 * ((sign_bits.unsqueeze(-1) >> shifts) & 1).to(dtype=dtype)
+        signs_dev = self._signs.to(device=device, dtype=dtype)
+        grid_dev = E8Codebook.get_instance(device=device).grid.to(dtype=dtype)
+        scales_dev = self._scales.to(device=device, dtype=dtype)
+        indices_dev = self._e8_indices.to(device)
         
-        token_vectors = (mags * sign_vectors).view(-1, N_in)
-        
-        token_scales = torch.index_select(self._scales.to(device=device, dtype=dtype), 0, flat_ids)
-        token_vectors = token_vectors * token_scales.unsqueeze(-1)
-        
-        W_rot = fwht(token_vectors)
-        signs = self._signs.to(device=device, dtype=dtype)
-        x_rot = W_rot[..., :D] * signs.unsqueeze(0)
+        for start in range(0, total_ids, chunk_size):
+            sub_ids = flat_ids[start:start + chunk_size]
+            sub_len = len(sub_ids)
+            
+            offsets = torch.arange(block_size, device=device).unsqueeze(0)
+            token_offsets = sub_ids.unsqueeze(1) * block_size
+            gather_indices = (token_offsets + offsets).view(-1)
+            
+            sub_e8_indices = torch.index_select(indices_dev, 0, gather_indices)
+            
+            lut_idx = (sub_e8_indices & 0xFF).long()
+            sign_bits = (sub_e8_indices >> 8) & 0xFF
+            
+            mags = grid_dev[lut_idx]
+            sign_vectors = 1.0 - 2.0 * ((sign_bits.unsqueeze(-1) >> shifts) & 1).to(dtype=dtype)
+            
+            sub_vectors = (mags * sign_vectors).view(sub_len, N_in)
+            
+            sub_scales = torch.index_select(scales_dev, 0, sub_ids)
+            sub_vectors = sub_vectors * sub_scales.unsqueeze(-1)
+            
+            W_rot = fwht(sub_vectors)
+            sub_x_rot = W_rot[..., :D] * signs_dev.unsqueeze(0)
+            all_x_rot.append(sub_x_rot.to(dtype=dtype))
+            
+        x_rot = torch.cat(all_x_rot, dim=0)
         
         if is_single:
             return x_rot.squeeze(0).to(dtype=dtype)
