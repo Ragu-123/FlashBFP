@@ -177,20 +177,23 @@ class HIVQLinear(torch.nn.Module):
         codebook_norms = torch.sum(codebook_half**2, dim=-1) # [65536]
         
         indices = []
-        chunk_size = 131072  # Chunk size of 1M elements to restrict peak VRAM to under 10MB
+        chunk_size = 131072  # Chunk size for E8 Conway-Sloane rounding (lightweight memory)
         for i in range(0, num_blocks, chunk_size):
             block_group = W_norm_grouped[i:i+chunk_size]
             
             # Map chunk to E8 using Conway-Sloane on GPU
             e8_points_chunk = conway_sloane_e8(block_group)
             
-            # Cast chunk to float16 for Tensor Core search
+            # Run codebook search in smaller batches to guarantee low memory usage (536 MB peak VRAM)
             e8_points_half = e8_points_chunk.to(dtype=torch.float16, device=comp_device)
-            block_norms = torch.sum(e8_points_half**2, dim=-1, keepdim=True)
-            
-            # Memory-efficient matrix multiplication search
-            dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(e8_points_half, codebook_half.T) # [B, 65536]
-            indices.append(torch.argmin(dists, dim=-1))
+            batch_size = 4096
+            for j in range(0, e8_points_half.shape[0], batch_size):
+                block = e8_points_half[j:j+batch_size] # [B, 8]
+                block_norms = torch.sum(block**2, dim=-1, keepdim=True) # [B, 1]
+                
+                # Distance expansion in float16: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
+                dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T) # [B, 65536]
+                indices.append(torch.argmin(dists, dim=-1))
             
         indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
         
@@ -305,20 +308,23 @@ class HIVQEmbedding(torch.nn.Module):
         codebook_norms = torch.sum(codebook_half**2, dim=-1) # [65536]
         
         indices = []
-        chunk_size = 131072  # Chunk size of 1M elements to restrict peak VRAM to under 10MB
+        chunk_size = 131072  # Chunk size for E8 Conway-Sloane rounding (lightweight memory)
         for i in range(0, num_blocks, chunk_size):
             block_group = W_norm_grouped[i:i+chunk_size]
             
             # Map chunk to E8 using Conway-Sloane on GPU
             e8_points_chunk = conway_sloane_e8(block_group)
             
-            # Cast chunk to float16 for Tensor Core search
+            # Run codebook search in smaller batches to guarantee low memory usage (536 MB peak VRAM)
             e8_points_half = e8_points_chunk.to(dtype=torch.float16, device=comp_device)
-            block_norms = torch.sum(e8_points_half**2, dim=-1, keepdim=True)
-            
-            # Memory-efficient matrix multiplication search
-            dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(e8_points_half, codebook_half.T) # [B, 65536]
-            indices.append(torch.argmin(dists, dim=-1))
+            batch_size = 4096
+            for j in range(0, e8_points_half.shape[0], batch_size):
+                block = e8_points_half[j:j+batch_size] # [B, 8]
+                block_norms = torch.sum(block**2, dim=-1, keepdim=True) # [B, 1]
+                
+                # Distance expansion in float16: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x . y
+                dists = block_norms + codebook_norms.unsqueeze(0) - 2.0 * torch.matmul(block, codebook_half.T) # [B, 65536]
+                indices.append(torch.argmin(dists, dim=-1))
             
         indices = torch.cat(indices, dim=0).to(torch.int32).to(device)
         
