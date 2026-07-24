@@ -408,7 +408,8 @@ class HIVQEmbedding(torch.nn.Module):
         x_rot = self.materialize_rows(input_ids, device=device, dtype=dtype)
         
         if self.embed_scale != 1.0:
-            x_rot = x_rot * self.embed_scale
+            scale_val = self.embed_scale.to(device=device, dtype=dtype) if isinstance(self.embed_scale, torch.Tensor) else float(self.embed_scale)
+            x_rot = x_rot * scale_val
             
         return x_rot.view(*input_ids.shape, self.embedding_dim)
         
