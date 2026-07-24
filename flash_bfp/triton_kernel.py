@@ -88,12 +88,12 @@ def oabf_gemm_kernel(
             val2 = tl.where(signs2 == 1, -1.0, 1.0) * (mantissas2.to(tl.float32) / 15.0) * tl.exp2(exp)
             
             # Concatenate along the row dimension to get a (16, BLOCK_SIZE_N) block
-            val_block = tl.cat(val1, val2, dim=0)
+            val_block = tl.cat(val1, val2)
             
             if w_tile is None:
                 w_tile = val_block
             else:
-                w_tile = tl.cat(w_tile, val_block, dim=0)
+                w_tile = tl.cat(w_tile, val_block)
                 
         accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
