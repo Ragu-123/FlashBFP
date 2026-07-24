@@ -76,7 +76,6 @@ class HIVQLinear(torch.nn.Module):
         self.out_features = out_features
         self.has_bias = bias
         self.compressed = False
-        self._cached_weight = None
         
         # Register empty buffers for state dict loading/resizing
         self.register_buffer('_signs', torch.empty(0, dtype=torch.float32))
@@ -92,12 +91,10 @@ class HIVQLinear(torch.nn.Module):
         """Rotates weight using RHT, maps to E8P lattice, and saves compressed representations in a row-chunked manner."""
         comp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
-        # Calculate padded input features dimension
         D = self.in_features
         N_in = D if (D & (D - 1)) == 0 else 2 ** ((D - 1).bit_length())
-        N_in = max(N_in, 8)  # Ensure dimension is at least 8 for 8D block grouping
+        N_in = max(N_in, 8)
         
-        # 1. Generate Rademacher signs on GPU
         signs = (torch.randint(0, 2, (self.in_features,), dtype=torch.float32, device=comp_device) * 2.0 - 1.0).to(dtype=W.dtype)
         
         row_chunk_size = 16384
@@ -112,28 +109,22 @@ class HIVQLinear(torch.nn.Module):
             end_row = min(start_row + row_chunk_size, self.out_features)
             W_chunk = W[start_row:end_row].to(comp_device)
             
-            # 2. Apply Rademacher signs and forward FWHT
             W_chunk_signed = W_chunk * signs.unsqueeze(0)
             W_chunk_padded = torch.nn.functional.pad(W_chunk_signed, (0, N_in - D), mode='constant', value=0.0)
             W_chunk_rot = fwht(W_chunk_padded)
             
-            # 3. Calculate row-wise scale factors
             scales_chunk = torch.max(torch.abs(W_chunk_rot), dim=-1, keepdim=True)[0] / 3.0
             scales_chunk = torch.clamp(scales_chunk, min=1e-5)
             all_scales.append(scales_chunk.to(device))
             
-            W_chunk_norm = W_chunk_rot / scales_chunk # shape [rows, N_in]
+            W_chunk_norm = W_chunk_rot / scales_chunk
+            W_blocks = W_chunk_norm.view(-1, 8)
             
-            # 4. Reshape to 8D vectors
-            W_blocks = W_chunk_norm.view(-1, 8) # [rows * N_in // 8, 8]
-            
-            # 5. Extract 8-bit sign mask per block
             block_signs = (W_blocks < 0).to(torch.int32)
             sign_bits = torch.zeros(W_blocks.shape[0], dtype=torch.int32, device=comp_device)
             for b in range(8):
                 sign_bits |= (block_signs[:, b] << b)
                 
-            # 6. Map absolute magnitudes to 256-entry E8P grid in micro-batches to cap VRAM
             W_abs_all = W_blocks.float().abs()
             block_batch_size = 32768
             lut_idx_list = []
@@ -143,7 +134,6 @@ class HIVQLinear(torch.nn.Module):
                 lut_idx_list.append(torch.argmin(dists_sub, dim=-1).to(torch.int32))
             lut_idx = torch.cat(lut_idx_list, dim=0)
             
-            # 7. Pack into 16-bit combined index (upper 8 bits = signs, lower 8 bits = lut_idx)
             packed_idx = (sign_bits << 8) | lut_idx
             all_indices.append(packed_idx.to(device))
             
@@ -155,12 +145,9 @@ class HIVQLinear(torch.nn.Module):
         self.register_buffer('_e8_indices', indices.to(device))
         
         self.compressed = True
-        self._cached_weight = None
 
     def materialize_weight(self, device, dtype):
-        if self._cached_weight is not None and self._cached_weight.device == device and self._cached_weight.dtype == dtype:
-            return self._cached_weight
-            
+        """Dynamic per-call dequantization without persistent VRAM caching (keeps VRAM < 2.1 GB)."""
         D = self.in_features
         N_in = D if (D & (D - 1)) == 0 else 2 ** ((D - 1).bit_length())
         N_in = max(N_in, 8)
@@ -169,27 +156,21 @@ class HIVQLinear(torch.nn.Module):
         scales = self._scales.to(device=device, dtype=dtype)
         e8_indices = self._e8_indices.to(device=device)
         
-        # Deconstruct 16-bit indices into 8-bit lut_idx and 8-bit sign_bits
         lut_idx = (e8_indices & 0xFF).long()
         sign_bits = (e8_indices >> 8) & 0xFF
         
-        # Lookup magnitudes from 256-entry grid
         grid = E8Codebook.get_instance(device=device).grid.to(dtype=dtype)
-        mags = grid[lut_idx] # [out_features * N_in // 8, 8]
+        mags = grid[lut_idx]
         
-        # Reconstruct element-wise signs (+1 or -1)
         shifts = torch.arange(8, device=device)
         sign_vectors = 1.0 - 2.0 * ((sign_bits.unsqueeze(-1) >> shifts) & 1).to(dtype=dtype)
         
         W_dequant = (mags * sign_vectors).view(self.out_features, N_in)
         W_dequant = W_dequant * scales.unsqueeze(-1)
         
-        # Reconstruct original weight space via IFWHT
         W_rot = fwht(W_dequant)
         W_reconstructed = W_rot[..., :D] * signs.unsqueeze(0)
-        
-        self._cached_weight = W_reconstructed
-        return self._cached_weight
+        return W_reconstructed
         
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         if not self.compressed:
@@ -229,7 +210,6 @@ class HIVQLinear(torch.nn.Module):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
         self.compressed = True
-        self._cached_weight = None
 
     @property
     def weight(self) -> torch.Tensor:
@@ -240,6 +220,35 @@ class HIVQLinear(torch.nn.Module):
         return self.materialize_weight(device, dtype)
 
 
+class HIVQEmbeddingWeightProxy:
+    """
+    Lightweight proxy for HIVQEmbedding.weight that supports sliced row indexing
+    (e.g., embed_tokens.weight[pad_token_id, :]) without materializing all 256,000 rows.
+    """
+    def __init__(self, embed_module):
+        self.embed_module = embed_module
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            row_idx = idx[0]
+            col_idx = idx[1] if len(idx) > 1 else slice(None)
+            rows = self.embed_module.materialize_rows(row_idx)
+            return rows[..., col_idx]
+        return self.embed_module.materialize_rows(idx)
+
+    @property
+    def shape(self):
+        return (self.embed_module.num_embeddings, self.embed_module.embedding_dim)
+
+    @property
+    def dtype(self):
+        return torch.bfloat16
+
+    @property
+    def device(self):
+        return self.embed_module._e8_indices.device
+
+
 class HIVQEmbedding(torch.nn.Module):
     """Embedding layer using 2-bit E8P lattice vector quantization and Rademacher-Hadamard rotation."""
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int = None, embed_scale: float = 1.0):
@@ -248,7 +257,6 @@ class HIVQEmbedding(torch.nn.Module):
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
         self.compressed = False
-        self._cached_weight = None
         self.register_buffer("embed_scale", torch.tensor(embed_scale), persistent=True)
         
         self.register_buffer('_signs', torch.empty(0, dtype=torch.float32))
@@ -292,7 +300,6 @@ class HIVQEmbedding(torch.nn.Module):
             for b in range(8):
                 sign_bits |= (block_signs[:, b] << b)
                 
-            # Map absolute magnitudes to 256-entry E8P grid in micro-batches to cap VRAM
             W_abs_all = W_blocks.float().abs()
             block_batch_size = 32768
             lut_idx_list = []
@@ -313,22 +320,37 @@ class HIVQEmbedding(torch.nn.Module):
         self.register_buffer('_e8_indices', indices.to(device))
         
         self.compressed = True
-        self._cached_weight = None
 
-    def materialize_weight(self, device, dtype):
-        if self._cached_weight is not None and self._cached_weight.device == device and self._cached_weight.dtype == dtype:
-            return self._cached_weight
+    def materialize_rows(self, idxs, device=None, dtype=None):
+        """Dequantizes ONLY requested row indices (e.g. pad_token_id), consuming ~0 VRAM."""
+        if device is None:
+            device = self._e8_indices.device
+        if dtype is None:
+            dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+            
+        is_single = isinstance(idxs, int)
+        if is_single:
+            flat_ids = torch.tensor([idxs], device=device)
+        elif isinstance(idxs, slice):
+            flat_ids = torch.arange(self.num_embeddings, device=device)[idxs]
+        elif isinstance(idxs, torch.Tensor):
+            flat_ids = idxs.to(device).view(-1)
+        else:
+            flat_ids = torch.tensor(idxs, device=device).view(-1)
             
         D = self.embedding_dim
         N_in = D if (D & (D - 1)) == 0 else 2 ** ((D - 1).bit_length())
         N_in = max(N_in, 8)
+        block_size = N_in // 8
         
-        signs = self._signs.to(device=device, dtype=dtype)
-        scales = self._scales.to(device=device, dtype=dtype)
-        e8_indices = self._e8_indices.to(device=device)
+        offsets = torch.arange(block_size, device=device).unsqueeze(0)
+        token_offsets = flat_ids.unsqueeze(1) * block_size
+        gather_indices = (token_offsets + offsets).view(-1)
         
-        lut_idx = (e8_indices & 0xFF).long()
-        sign_bits = (e8_indices >> 8) & 0xFF
+        token_e8_indices = torch.index_select(self._e8_indices.to(device), 0, gather_indices)
+        
+        lut_idx = (token_e8_indices & 0xFF).long()
+        sign_bits = (token_e8_indices >> 8) & 0xFF
         
         grid = E8Codebook.get_instance(device=device).grid.to(dtype=dtype)
         mags = grid[lut_idx]
@@ -336,14 +358,21 @@ class HIVQEmbedding(torch.nn.Module):
         shifts = torch.arange(8, device=device)
         sign_vectors = 1.0 - 2.0 * ((sign_bits.unsqueeze(-1) >> shifts) & 1).to(dtype=dtype)
         
-        W_dequant = (mags * sign_vectors).view(self.num_embeddings, N_in)
-        W_dequant = W_dequant * scales.unsqueeze(-1)
+        token_vectors = (mags * sign_vectors).view(-1, N_in)
         
-        W_rot = fwht(W_dequant)
-        W_reconstructed = W_rot[..., :D] * signs.unsqueeze(0)
+        token_scales = torch.index_select(self._scales.to(device), 0, flat_ids)
+        token_vectors = token_vectors * token_scales.unsqueeze(-1)
         
-        self._cached_weight = W_reconstructed
-        return self._cached_weight
+        W_rot = fwht(token_vectors)
+        signs = self._signs.to(device=device, dtype=dtype)
+        x_rot = W_rot[..., :D] * signs.unsqueeze(0)
+        
+        if is_single:
+            return x_rot.squeeze(0)
+        return x_rot
+
+    def materialize_weight(self, device, dtype):
+        return self.materialize_rows(torch.arange(self.num_embeddings, device=device), device=device, dtype=dtype)
         
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         if not self.compressed:
@@ -352,38 +381,7 @@ class HIVQEmbedding(torch.nn.Module):
         device = input_ids.device
         dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
         
-        D = self.embedding_dim
-        N_in = D if (D & (D - 1)) == 0 else 2 ** ((D - 1).bit_length())
-        N_in = max(N_in, 8)
-        block_size = N_in // 8
-        
-        signs = self._signs.to(device=device, dtype=dtype)
-        scales = self._scales.to(device=device, dtype=dtype)
-        e8_indices = self._e8_indices.to(device=device)
-        grid = E8Codebook.get_instance(device=device).grid.to(dtype=dtype)
-        
-        flat_ids = input_ids.view(-1)
-        
-        offsets = torch.arange(block_size, device=device).unsqueeze(0)
-        token_offsets = flat_ids.unsqueeze(1) * block_size
-        gather_indices = (token_offsets + offsets).view(-1)
-        
-        token_e8_indices = torch.index_select(e8_indices, 0, gather_indices)
-        
-        lut_idx = (token_e8_indices & 0xFF).long()
-        sign_bits = (token_e8_indices >> 8) & 0xFF
-        
-        mags = grid[lut_idx]
-        shifts = torch.arange(8, device=device)
-        sign_vectors = 1.0 - 2.0 * ((sign_bits.unsqueeze(-1) >> shifts) & 1).to(dtype=dtype)
-        
-        token_vectors = (mags * sign_vectors).view(-1, N_in)
-        
-        token_scales = torch.index_select(scales, 0, flat_ids)
-        token_vectors = token_vectors * token_scales.unsqueeze(-1)
-        
-        W_rot = fwht(token_vectors)
-        x_rot = W_rot[..., :D] * signs.unsqueeze(0)
+        x_rot = self.materialize_rows(input_ids, device=device, dtype=dtype)
         
         if self.embed_scale != 1.0:
             x_rot = x_rot * self.embed_scale
@@ -414,15 +412,12 @@ class HIVQEmbedding(torch.nn.Module):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
         self.compressed = True
-        self._cached_weight = None
 
     @property
-    def weight(self) -> torch.Tensor:
+    def weight(self):
         if not self.compressed:
             raise RuntimeError("Embedding has not been compressed.")
-        device = self._e8_indices.device
-        dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
-        return self.materialize_weight(device, dtype)
+        return HIVQEmbeddingWeightProxy(self)
 
 
 class HIVQTiedHead(torch.nn.Module):
@@ -443,11 +438,9 @@ class HIVQTiedHead(torch.nn.Module):
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         device = X.device
         dtype = X.dtype
-        W = self.embed_module.materialize_weight(device, dtype)
+        W = self.embed_module.materialize_rows(torch.arange(self.out_features, device=device), device=device, dtype=dtype)
         return torch.nn.functional.linear(X, W)
         
     @property
-    def weight(self) -> torch.Tensor:
-        device = self.embed_module._e8_indices.device
-        dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
-        return self.embed_module.materialize_weight(device, dtype)
+    def weight(self):
+        return HIVQEmbeddingWeightProxy(self.embed_module)
