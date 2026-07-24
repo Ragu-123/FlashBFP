@@ -23,6 +23,8 @@ except ImportError:
 def oabf_gemm_kernel(
     x_ptr, y_ptr,
     exponents_ptr, signs_ptr, payload_ptr,
+    sp_r_idx_ptr, sp_c_idx_ptr, sp_v_val_ptr, sp_block_ptr,
+    sparse_count,
     M, N, K,
     stride_am, stride_ak,
     stride_cm, stride_cn,
@@ -81,6 +83,29 @@ def oabf_gemm_kernel(
         
         accumulator += tl.dot(a_tile, w_tile.to(a_tile.dtype))
         
+    # --- Fused Outliers SpMV Path ---
+    if sparse_count > 0:
+        start_idx = tl.load(sp_block_ptr + pid_n)
+        end_idx = tl.load(sp_block_ptr + pid_n + 1)
+        
+        idx = start_idx
+        while idx < end_idx:
+            r = tl.load(sp_r_idx_ptr + idx)
+            c_local = tl.load(sp_c_idx_ptr + idx)
+            v = tl.load(sp_v_val_ptr + idx)
+            
+            # Load X[:, r] (shape: BLOCK_SIZE_M)
+            x_offs = offs_am * stride_am + r * stride_ak
+            x_mask = offs_am < M
+            x_val = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0)
+            
+            # Add product to column c_local of accumulator in-registers
+            col_mask = tl.arange(0, BLOCK_SIZE_N)[None, :] == c_local
+            mask = x_mask[:, None] & col_mask
+            accumulator = tl.where(mask, accumulator + (x_val * v)[:, None], accumulator)
+            
+            idx += 1
+            
     c_ptr = y_ptr + offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
     tl.store(c_ptr, accumulator, mask=c_mask)
@@ -124,7 +149,35 @@ def _cpu_fallback_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     W_reconstructed = unpacked_blocks.flatten().view(C_padded, R_padded)
     W_reconstructed = W_reconstructed[:C_orig, :R_orig]
     
-    return torch.matmul(X, W_reconstructed.t())
+    Y_dense = torch.matmul(X, W_reconstructed.t())
+    
+    # --- CPU Fallback Sparse Outliers SpMV ---
+    sparse_count = dense_payload.get('sparse_count', 0)
+    sp_r_idx = dense_payload.get('sp_r_idx')
+    sp_c_idx = dense_payload.get('sp_c_idx')
+    sp_v_val = dense_payload.get('sp_v_val')
+    sp_block_ptr = dense_payload.get('sp_block_ptr')
+    
+    if sparse_count > 0 and sp_r_idx is not None:
+        num_col_blocks = len(sp_block_ptr) - 1
+        c_idx_reconstructed = torch.zeros_like(sp_c_idx)
+        for b in range(num_col_blocks):
+            start = sp_block_ptr[b].item()
+            end = sp_block_ptr[b+1].item()
+            if start < end:
+                c_idx_reconstructed[start:end] = b * 64 + sp_c_idx[start:end]
+                
+        X_flat = X.view(-1, X.shape[-1])
+        r_idx = sp_r_idx.to(device=X.device, dtype=torch.long)
+        c_idx = c_idx_reconstructed.to(device=X.device, dtype=torch.long)
+        v_val = sp_v_val.to(device=X.device, dtype=X.dtype)
+        
+        if c_idx.numel() > 0:
+            X_active = X_flat[:, r_idx]
+            products = X_active * v_val[None, :]
+            Y_dense.index_add_(1, c_idx, products)
+            
+    return Y_dense
 
 
 def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
@@ -174,6 +227,21 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
     if K_x < R_padded:
         X = torch.nn.functional.pad(X, (0, R_padded - K_x), mode='constant', value=0.0)
         
+    # Pass sparse outliers to Triton kernel if count > 0
+    sparse_count = dense_payload.get('sparse_count', 0)
+    sp_r_idx = dense_payload.get('sp_r_idx')
+    sp_c_idx = dense_payload.get('sp_c_idx')
+    sp_v_val = dense_payload.get('sp_v_val')
+    sp_block_ptr = dense_payload.get('sp_block_ptr')
+    
+    if sparse_count == 0 or sp_r_idx is None:
+        dummy_tensor_int = torch.zeros(1, dtype=torch.int32, device=target_device)
+        dummy_tensor_float = torch.zeros(1, dtype=torch.float32, device=target_device)
+        sp_r_idx = dummy_tensor_int
+        sp_c_idx = dummy_tensor_int
+        sp_v_val = dummy_tensor_float
+        sp_block_ptr = dummy_tensor_int
+        
     Y = torch.empty((M, C_padded), device=target_device, dtype=X.dtype)
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(C_padded, META['BLOCK_SIZE_N']),)
     
@@ -184,6 +252,8 @@ def oabf_gemm(X: torch.Tensor, dense_payload: Dict) -> torch.Tensor:
             exponents,
             signs,
             payload,
+            sp_r_idx, sp_c_idx, sp_v_val, sp_block_ptr,
+            sparse_count,
             M, C_padded, R_padded,
             X.stride(0), X.stride(1),
             Y.stride(0), Y.stride(1),
@@ -247,7 +317,7 @@ class OABFLinear(torch.nn.Module):
             'count': sparse_outliers['count'],
         }
         
-        # Pre-compute and cache index tensors for SpMV path to avoid recalculating on every forward pass
+        # Pre-compute and cache Compressed Column-Block Sparse (CCBS) indexing tensors
         if sparse_outliers['count'] > 0:
             block_idx_cpu = sparse_outliers['block_idx'].long()
             offset_cpu = sparse_outliers['offset'].long()
@@ -277,14 +347,29 @@ class OABFLinear(torch.nn.Module):
                 c_idx_cpu = torch.clamp(c_idx_cpu, 0, self.out_features - 1)
                 r_idx_cpu = torch.clamp(r_idx_cpu, 0, self.in_features - 1)
                 
+            # Sort outliers by column block index (BLOCK_SIZE_N = 64)
+            b_idx = c_idx_cpu // 64
+            sort_idx = torch.argsort(b_idx)
+            
+            r_idx_sorted = r_idx_cpu[sort_idx]
+            c_local_sorted = (c_idx_cpu[sort_idx] % 64).to(torch.int32)
+            v_val_sorted = v_val_cpu[sort_idx]
+            b_idx_sorted = b_idx[sort_idx]
+            
+            # Construct the block pointer array of shape (num_col_blocks + 1,)
+            num_col_blocks = padded_C // 64
+            sp_block_ptr_cpu = torch.searchsorted(b_idx_sorted, torch.arange(num_col_blocks + 1))
+            
             # Store cached GPU/device tensors as standard attributes (not registered buffers)
-            self._sp_r_idx = r_idx_cpu.to(device)
-            self._sp_c_idx = c_idx_cpu.to(device)
-            self._sp_v_val = v_val_cpu.to(device)
+            self._sp_r_idx = r_idx_sorted.to(device)
+            self._sp_c_idx = c_local_sorted.to(device)
+            self._sp_v_val = v_val_sorted.to(device)
+            self._sp_block_ptr = sp_block_ptr_cpu.to(device)
         else:
             self._sp_r_idx = None
             self._sp_c_idx = None
             self._sp_v_val = None
+            self._sp_block_ptr = None
         
         self.compressed = True
 
@@ -311,6 +396,13 @@ class OABFLinear(torch.nn.Module):
         if self._dp_payload.device != exec_device:
             self._dp_payload = self._dp_payload.to(exec_device)
             
+        if self._sparse_meta['count'] > 0 and self._sp_r_idx is not None:
+            if self._sp_r_idx.device != exec_device:
+                self._sp_r_idx = self._sp_r_idx.to(exec_device)
+                self._sp_c_idx = self._sp_c_idx.to(exec_device)
+                self._sp_v_val = self._sp_v_val.to(exec_device)
+                self._sp_block_ptr = self._sp_block_ptr.to(exec_device)
+                
         X_flat = X.view(-1, self.in_features)
         
         # Move X to the execution device if accelerate placed them differently
@@ -323,29 +415,14 @@ class OABFLinear(torch.nn.Module):
             'payload': self._dp_payload,
             'padded_shape': self._payload_meta['padded_shape'],
             'orig_shape': self._payload_meta['orig_shape'],
+            'sp_r_idx': self._sp_r_idx,
+            'sp_c_idx': self._sp_c_idx,
+            'sp_v_val': self._sp_v_val,
+            'sp_block_ptr': self._sp_block_ptr,
+            'sparse_count': self._sparse_meta['count'],
         }
         Y_dense = oabf_gemm(X_flat, live_payload)
         
-        # Fast Outlier SpMV Path using Cached GPU Indices
-        if self._sparse_meta['count'] > 0 and self._sp_r_idx is not None:
-            # Sync pre-computed attributes to exec_device if needed
-            if self._sp_r_idx.device != exec_device:
-                self._sp_r_idx = self._sp_r_idx.to(exec_device)
-                self._sp_c_idx = self._sp_c_idx.to(exec_device)
-                self._sp_v_val = self._sp_v_val.to(exec_device)
-                
-            r_idx = self._sp_r_idx
-            c_idx = self._sp_c_idx
-            v_val = self._sp_v_val.to(X_flat.dtype)
-            
-            if c_idx.numel() > 0:
-                X_active = X_flat[:, r_idx]
-                products = X_active * v_val[None, :]
-                
-                Y_sparse = torch.zeros_like(Y_dense)
-                Y_sparse.index_add_(1, c_idx, products)
-                Y_dense = Y_dense + Y_sparse
-            
         if self.bias is not None:
             bias = self.bias
             if bias.device != exec_device:
