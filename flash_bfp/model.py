@@ -34,6 +34,14 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         display_name = full_name.replace("model.model.language_model.", "")
         pbar.set_postfix_str(f"{display_name[:45]}")
         
+        # Determine target device: if weight is on 'meta' device (no actual data),
+        # fall back to cpu. Meta tensors appear with device_map="auto" + offloading.
+        weight_device = original_linear.weight.device
+        if weight_device.type == 'meta':
+            target_device = torch.device('cpu')
+        else:
+            target_device = weight_device
+        
         # Instantiate OABF Linear Layer
         oabf_layer = OABFLinear(
             in_features=original_linear.in_features,
@@ -43,13 +51,17 @@ def compress_gemma_model(model: torch.nn.Module, compressor: OABFCompressor) -> 
         
         # Copy bias if present
         if original_linear.bias is not None:
-            oabf_layer.bias.data.copy_(original_linear.bias.data)
+            bias_dev = original_linear.bias.device
+            if bias_dev.type == 'meta':
+                pass  # Skip copy for meta bias; bias buffer is already zeros
+            else:
+                oabf_layer.bias.data.copy_(original_linear.bias.data)
             
         # Send oabf_layer to the target device immediately to support multi-GPU sharding
-        oabf_layer = oabf_layer.to(original_linear.weight.device)
+        oabf_layer = oabf_layer.to(target_device)
         # Compress and load weight parameters on-the-fly
         # Weight in nn.Linear is stored as (out_features, in_features)
-        oabf_layer.load_from_weight(original_linear.weight.data, compressor, device=original_linear.weight.device)
+        oabf_layer.load_from_weight(original_linear.weight.data, compressor, device=target_device)
         
         # Replace sub-module inside the parent module
         setattr(parent_module, sub_name, oabf_layer)

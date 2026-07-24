@@ -48,21 +48,33 @@ def oabf_gemm_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a_ptr = x_ptr + offs_am[:, None] * stride_am + (k * BLOCK_SIZE_K + offs_k)[None, :] * stride_ak
-        a_mask = offs_am[:, None] < M
+        # --- Load activation tile with boundary mask ---
+        a_offs_k = k * BLOCK_SIZE_K + offs_k
+        a_ptr = x_ptr + offs_am[:, None] * stride_am + a_offs_k[None, :] * stride_ak
+        a_mask = (offs_am[:, None] < M) & (a_offs_k[None, :] < K)
         a_tile = tl.load(a_ptr, mask=a_mask, other=0.0)
         
         w_tile = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
         
+        # Total number of blocks in the compressed payload
+        num_k_blocks = K // 16
+        
         for step in range(0, BLOCK_SIZE_K // 16):
             k_block = k * (BLOCK_SIZE_K // 16) + step
-            block_idx = offs_bn[None, :] * (K // 16) + k_block
+            block_idx = offs_bn[None, :] * num_k_blocks + k_block
             
-            exp = tl.load(exponents_ptr + block_idx).to(tl.float32)
-            signs = tl.load(signs_ptr + block_idx).to(tl.int32)
+            # Bounds mask: prevent reading past the payload buffer
+            # Max valid block_idx = (C_padded - 1) * num_k_blocks + (num_k_blocks - 1)
+            # = C_padded * num_k_blocks - 1 = total_blocks - 1
+            total_blocks = N * num_k_blocks
+            b_mask = (offs_bn[None, :] < N) & (k_block < num_k_blocks)
             
-            p_word1 = tl.load(payload_ptr + block_idx * 2)
-            p_word2 = tl.load(payload_ptr + block_idx * 2 + 1)
+            exp = tl.load(exponents_ptr + block_idx, mask=b_mask, other=0.0).to(tl.float32)
+            signs = tl.load(signs_ptr + block_idx, mask=b_mask, other=0).to(tl.int32)
+            
+            p_mask = b_mask  # Same mask for payload (2 words per block)
+            p_word1 = tl.load(payload_ptr + block_idx * 2, mask=p_mask, other=0)
+            p_word2 = tl.load(payload_ptr + block_idx * 2 + 1, mask=p_mask, other=0)
             
             for i in range(8):
                 mantissa = (p_word1 >> (i * 4)) & 0xF
@@ -213,6 +225,9 @@ class OABFLinear(torch.nn.Module):
         PyTorch versions and prevents Triton pointer access errors from exotic
         dtypes like int8, int16, uint16 or uint32.
         """
+        # Meta tensors have shape but no data — materialize as zeros on CPU
+        if W.device.type == 'meta':
+            W = torch.zeros(W.shape, dtype=W.dtype, device='cpu')
         dense_payload, sparse_outliers = compressor.compress_matrix(W.cpu())
         
         # Cast to universally-supported dtypes BEFORE .to(device)
