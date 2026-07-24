@@ -194,8 +194,8 @@ class HIVQLinear(torch.nn.Module):
             e8_points_chunk = conway_sloane_e8(W_norm_grouped)
             e8_points_half = e8_points_chunk.to(dtype=torch.float16, device=comp_device)
             
-            # Distance search in batches of 16384 blocks to speed up compression by 4x
-            batch_size = 16384
+            # Distance search in batches of 4096 blocks to prevent VRAM OOM
+            batch_size = 4096
             chunk_indices = []
             for j in range(0, e8_points_half.shape[0], batch_size):
                 block = e8_points_half[j:j+batch_size]
@@ -353,8 +353,8 @@ class HIVQEmbedding(torch.nn.Module):
             e8_points_chunk = conway_sloane_e8(W_norm_grouped)
             e8_points_half = e8_points_chunk.to(dtype=torch.float16, device=comp_device)
             
-            # Distance search in batches of 16384 blocks to speed up compression by 4x
-            batch_size = 16384
+            # Distance search in batches of 4096 blocks to prevent VRAM OOM
+            batch_size = 4096
             chunk_indices = []
             for j in range(0, e8_points_half.shape[0], batch_size):
                 block = e8_points_half[j:j+batch_size]
